@@ -1,0 +1,299 @@
+/* Design tokens: keep 3-5 colors total */
+:root {
+  --color-primary: #0ea5e9; /* brand blue */
+  --color-accent: #f59e0b; /* accent amber */
+  --color-text: #0f172a; /* slate-900 */
+  --color-muted: #94a3b8; /* slate-400 */
+  --color-bg: #f8fafc; /* slate-50 */
+  --radius: 0.5rem;
+}
+
+@import "tailwindcss";
+
+@layer base {
+  html,
+  body,
+  #root {
+    @apply h-full;
+  }
+  body {
+    @apply bg-slate-50 text-slate-900 antialiased;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans",
+    "Apple Color Emoji", "Segoe UI Emoji";
+  background: var(--color-bg);
+  color: var(--color-text);
+  line-height: 1.5;
+}
+
+/* Layout */
+.app-shell {
+  display: flex;
+  min-height: 100dvh;
+  flex-direction: column;
+}
+
+.container {
+  width: 100%;
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+header.navbar {
+  background: white;
+  border-bottom: 1px solid #e5e7eb;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.brand__logo {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: var(--color-primary);
+  color: white;
+  font-weight: 800;
+}
+
+.nav {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+/* Buttons/links */
+a.navlink,
+button.btn {
+  appearance: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--color-text);
+  padding: 0.5rem 0.75rem;
+  text-decoration: none;
+  font-size: 0.95rem;
+  @apply inline-flex items-center justify-center rounded-md border border-transparent px-3 py-2 text-sm font-medium transition focus:outline-none focus:ring-2 focus:ring-offset-2;
+}
+
+a.navlink.active {
+  background: var(--color-primary);
+  color: #fff;
+}
+
+button.btn.primary,
+a.btn.primary {
+  background: var(--color-primary);
+  color: #fff;
+  border-color: var(--color-primary);
+  @apply bg-sky-600 text-white hover:bg-sky-700 focus:ring-sky-600;
+}
+
+button.btn.ghost,
+a.btn.ghost {
+  background: transparent;
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+  @apply bg-transparent text-sky-700 border-sky-700 hover:bg-sky-50 focus:ring-sky-600;
+}
+
+button.btn.warn {
+  background: var(--color-accent);
+  color: #111827;
+  border-color: var(--color-accent);
+  @apply bg-amber-400 text-slate-900 hover:bg-amber-500 focus:ring-amber-400;
+}
+
+button.btn,
+a.btn {
+  cursor: pointer;
+}
+
+button.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Cards and panels */
+.card {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: var(--radius);
+  padding: 1rem;
+  @apply bg-white border border-slate-200 rounded-lg p-4 shadow-sm;
+}
+
+.grid {
+  display: grid;
+  gap: 1rem;
+  @apply grid gap-4;
+}
+
+.grid-2 {
+  grid-template-columns: 1fr;
+  @apply grid-cols-1 md:grid-cols-2 gap-4;
+}
+@media (min-width: 768px) {
+  .grid-2 {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.grid-3 {
+  grid-template-columns: 1fr;
+  @apply grid-cols-1 lg:grid-cols-3 gap-4;
+}
+@media (min-width: 900px) {
+  .grid-3 {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+.row {
+  @apply flex items-center gap-2;
+}
+
+/* Forms */
+.form {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.form-row {
+  display: grid;
+  gap: 0.35rem;
+}
+
+label {
+  font-size: 0.9rem;
+  color: var(--color-muted);
+  @apply text-sm text-slate-500;
+}
+
+input,
+select {
+  padding: 0.6rem 0.7rem;
+  border: 1px solid #e5e7eb;
+  border-radius: var(--radius);
+  font-size: 1rem;
+  background: #fff;
+  color: var(--color-text);
+  @apply w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-600;
+}
+
+.field {
+  @apply grid gap-1;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  background: #fff;
+  border-radius: var(--radius);
+  overflow: hidden;
+  @apply w-full border-collapse bg-white rounded-lg overflow-hidden;
+}
+
+.table th,
+.table td {
+  padding: 0.75rem;
+  border-bottom: 1px solid #e5e7eb;
+  text-align: left;
+  @apply px-3 py-2;
+}
+
+.table th {
+  background: #f1f5f9;
+  color: #334155;
+  font-weight: 600;
+  @apply bg-slate-100 text-slate-700 font-semibold text-left;
+}
+
+.table td {
+  @apply border-b border-slate-200;
+}
+
+.kpis {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: 1fr;
+  @apply grid gap-4;
+}
+@media (min-width: 700px) {
+  .kpis {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+.kpi {
+  background: white;
+  border: 1px solid #e5e7eb;
+  border-radius: var(--radius);
+  padding: 1rem;
+  @apply bg-white border border-slate-200 rounded-lg p-4 shadow-sm;
+}
+
+.kpi .label {
+  color: var(--color-muted);
+  font-size: 0.9rem;
+  @apply text-sm text-slate-500;
+}
+
+.kpi .value {
+  font-size: 1.4rem;
+  font-weight: 700;
+}
+
+.subtle {
+  color: var(--color-muted);
+  font-size: 0.9rem;
+}
+
+.footer {
+  margin-top: auto;
+  padding: 1rem;
+  color: var(--color-muted);
+  text-align: center;
+}
+
+.badge {
+  @apply inline-flex items-center rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700;
+}
+
+/* Add borders and pointer to all buttons; improve disabled styles */
+button {
+  @apply border border-slate-300 rounded-md cursor-pointer px-3 py-2;
+}
+button:disabled {
+  @apply opacity-50 cursor-not-allowed;
+}
+
+/* Ensure links styled as buttons also show pointer */
+a.button-like {
+  @apply border border-slate-300 rounded-md cursor-pointer px-3 py-2 inline-flex items-center;
+}
