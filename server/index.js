@@ -9,6 +9,7 @@ import productionRouter from "./routes/production.js"
 import invoicesRouter from "./routes/invoices.js"
 import paymentsRouter from "./routes/payments.js"
 import ledgerRouter from "./routes/ledger.js"
+import reportRoutes from "./routes/reports.js";
 import { authMiddleware } from "./lib/auth-mw.js"
 import { Inventory } from "./models/Inventory.js"
 import { Customer } from "./models/Customer.js"
@@ -34,6 +35,8 @@ app.use("/api/production", productionRouter)
 app.use("/api/invoices", invoicesRouter)
 app.use("/api/payments", paymentsRouter)
 app.use("/api/ledger", ledgerRouter)
+app.use("/api/reports", reportRoutes);
+
 
 app.get("/api/stats/counts", async (req, res) => {
   const [products, customers, inventory, invoices] = await Promise.all([

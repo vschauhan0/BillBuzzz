@@ -5,13 +5,34 @@ import { api } from "../lib/api"
 
 export default function Inventory() {
   const [rows, setRows] = useState([])
+  const [loading, setLoading] = useState(false)
 
+  // 🔹 Fetch inventory data
   async function load() {
-    const res = await api.get("/inventory")
-    setRows(res)
+    try {
+      setLoading(true)
+      const res = await api.get("/inventory")
+      setRows(res || [])
+    } catch (err) {
+      console.error("Failed to load inventory:", err)
+    } finally {
+      setLoading(false)
+    }
   }
+
   useEffect(() => {
     load()
+
+    // 🔹 Listen for inventory updates from other components (like invoices)
+    function handleInventoryUpdated() {
+      load()
+    }
+
+    window.addEventListener("inventory-updated", handleInventoryUpdated)
+
+    return () => {
+      window.removeEventListener("inventory-updated", handleInventoryUpdated)
+    }
   }, [])
 
   return (
@@ -26,7 +47,9 @@ export default function Inventory() {
       </div>
 
       <div className="card">
-        {rows.length === 0 ? (
+        {loading ? (
+          <p className="subtle">Loading inventory...</p>
+        ) : rows.length === 0 ? (
           <p className="subtle">No inventory entries yet.</p>
         ) : (
           <table className="table" aria-label="Inventory table">
@@ -40,9 +63,11 @@ export default function Inventory() {
             <tbody>
               {rows.map((r) => (
                 <tr key={r._id}>
-                  <td>{r.product?.sku}</td>
-                  <td>{r.product?.name}</td>
-                  <td style={{ textAlign: "right" }}>{r.quantity}</td>
+                  <td>{r.product?.sku || "—"}</td>
+                  <td>{r.product?.name || "Unnamed product"}</td>
+                  <td style={{ textAlign: "right" }}>
+                    {r.quantity != null ? r.quantity : 0}
+                  </td>
                 </tr>
               ))}
             </tbody>

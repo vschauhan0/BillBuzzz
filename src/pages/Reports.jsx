@@ -57,7 +57,8 @@ export default function Reports() {
                 : Number(it.pieceWith || 0) * Number(it.rateWith || 0)),
             0,
           ),
-          total: r.total || 0,
+          // 🔹 FIX: use grandTotal if total missing
+          total: r.grandTotal || r.total || 0,
         }))
       }
       setRows(Array.isArray(data) ? data : [])
@@ -80,9 +81,14 @@ export default function Reports() {
     })
   }, [rows, query])
 
+  // 🔹 FIX: Use grandTotal for totals too
   const totals = useMemo(() => {
-    const sales = filtered.filter((r) => r.type === "Sales").reduce((s, r) => s + Number(r.total || 0), 0)
-    const purchase = filtered.filter((r) => r.type === "Purchase").reduce((s, r) => s + Number(r.total || 0), 0)
+    const sales = filtered
+      .filter((r) => r.type === "Sales")
+      .reduce((s, r) => s + Number(r.grandTotal || r.total || 0), 0)
+    const purchase = filtered
+      .filter((r) => r.type === "Purchase")
+      .reduce((s, r) => s + Number(r.grandTotal || r.total || 0), 0)
     const profit = sales - purchase
     return { sales, purchase, profit }
   }, [filtered])
@@ -101,7 +107,13 @@ export default function Reports() {
     w.document.write("</tr></thead><tbody>")
     filtered.forEach((r) => {
       w.document.write(
-        `<tr><td>${r.date}</td><td>${r.type}</td><td>${r.number}</td><td>${r.customer}</td><td>${Number(r.totalWithout).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td><td>${Number(r.totalWith).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td><td>${Number(r.total).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td></tr>`,
+        `<tr><td>${r.date}</td><td>${r.type}</td><td>${r.number}</td><td>${r.customer}</td><td>${Number(
+          r.totalWithout,
+        ).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td><td>${Number(
+          r.totalWith,
+        ).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td><td>${Number(
+          r.grandTotal || r.total || 0,
+        ).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td></tr>`,
       )
     })
     w.document.write("</tbody></table></body></html>")
@@ -111,7 +123,11 @@ export default function Reports() {
     w.close()
   }
 
-  const fmt = (n) => Number(n || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  const fmt = (n) =>
+    Number(n || 0).toLocaleString("en-IN", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    })
 
   return (
     <main className="p-4 grid gap-4">
@@ -120,21 +136,11 @@ export default function Reports() {
         <div className="grid md:grid-cols-6 gap-3">
           <div>
             <label className="block text-sm mb-1">From</label>
-            <input
-              type="date"
-              className="w-full border rounded px-3 py-2"
-              value={from}
-              onChange={(e) => setFrom(e.target.value)}
-            />
+            <input type="date" className="w-full border rounded px-3 py-2" value={from} onChange={(e) => setFrom(e.target.value)} />
           </div>
           <div>
             <label className="block text-sm mb-1">To</label>
-            <input
-              type="date"
-              className="w-full border rounded px-3 py-2"
-              value={to}
-              onChange={(e) => setTo(e.target.value)}
-            />
+            <input type="date" className="w-full border rounded px-3 py-2" value={to} onChange={(e) => setTo(e.target.value)} />
           </div>
           <div>
             <label className="block text-sm mb-1">Type</label>
@@ -203,7 +209,7 @@ export default function Reports() {
                 <td className="border px-2 py-1">{r.customer}</td>
                 <td className="border px-2 py-1">{fmt(r.totalWithout)}</td>
                 <td className="border px-2 py-1">{fmt(r.totalWith)}</td>
-                <td className="border px-2 py-1">{fmt(r.total)}</td>
+                <td className="border px-2 py-1">{fmt(r.grandTotal || r.total)}</td>
               </tr>
             ))}
           </tbody>
