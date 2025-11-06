@@ -5,50 +5,62 @@ import { api } from "../lib/api"
 import JsBarcode from "jsbarcode"
 import { jsPDF } from "jspdf"
 
+/**
+ * Production component
+ */
+
 export default function Production() {
-  const [products, setProducts] = useState([])
-  const [productQuery, setProductQuery] = useState("") // search input state
-  const [selected, setSelected] = useState("")
+  const [purchaseItems, setPurchaseItems] = useState([])
+  const [activeRuns, setActiveRuns] = useState([])
+  const [selectedItemId, setSelectedItemId] = useState("")
   const [barcodeText, setBarcodeText] = useState("")
   const [quantity, setQuantity] = useState(1)
-  const [run, setRun] = useState(null)
-  const previewSvgContainerRef = useRef(null)
-  const canvasListRef = useRef([]) // list of canvases for multiple barcodes
-  const pollingRef = useRef(null)
+  const [polling, setPolling] = useState(false)
 
-  // Helper: ensure run object always has steps array
-  function normalizeRun(r) {
-    if (!r) return r
-    return { ...r, steps: Array.isArray(r.steps) ? r.steps : [] }
+  const previewSvgContainerRef = useRef(null)
+  const canvasListRef = useRef([])
+
+  async function loadPurchaseItems() {
+    try {
+      const items = await api.get("/purchases/receiving")
+      setPurchaseItems(Array.isArray(items) ? items : [])
+    } catch (err) {
+      console.error("Failed to load purchase items", err)
+      setPurchaseItems([])
+    }
   }
 
-  // load products
+  async function loadActiveRuns() {
+    try {
+      const runs = await api.get("/production/active/all")
+      setActiveRuns(Array.isArray(runs) ? runs : [])
+    } catch (err) {
+      console.error("Failed to load active runs", err)
+      setActiveRuns([])
+    }
+  }
+
   useEffect(() => {
-    let mounted = true
-    async function load() {
-      try {
-        const prods = await api.get("/products")
-        if (!mounted) return
-        setProducts(prods || [])
-      } catch (err) {
-        console.error("Failed to load products", err)
-      }
-    }
-    load()
-    return () => {
-      mounted = false
-    }
+    loadPurchaseItems()
+    loadActiveRuns()
+    startPolling()
+    return stopPolling
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const filteredProducts = useMemo(() => {
-    const q = productQuery.trim().toLowerCase()
-    if (!q) return products
-    return products.filter((p) => {
-      const n = (p.name || "").toLowerCase()
-      const s = (p.sku || "").toLowerCase()
-      return n.includes(q) || s.includes(q)
-    })
-  }, [productQuery, products])
+  function startPolling() {
+    if (polling) return
+    setPolling(true)
+    const id = setInterval(async () => {
+      await Promise.all([loadActiveRuns(), loadPurchaseItems()])
+    }, 4000)
+    startPolling._id = id
+  }
+  function stopPolling() {
+    if (!polling) return
+    clearInterval(startPolling._id)
+    setPolling(false)
+  }
 
   const barcodes = useMemo(() => {
     const qty = Math.max(1, Number(quantity || 1))
@@ -56,15 +68,7 @@ export default function Production() {
     return Array.from({ length: qty }, (_, i) => `${barcodeText}-${String(i + 1).padStart(3, "0")}`)
   }, [barcodeText, quantity])
 
-  // when selected changes, set suggested barcodeText from product SKU
   useEffect(() => {
-    const p = products.find((p) => p._id === selected)
-    if (p?.sku) setBarcodeText(p.sku)
-  }, [selected, products])
-
-  // render preview SVG and canvases when barcodes change
-  useEffect(() => {
-    // svg preview (first only)
     if (previewSvgContainerRef.current) {
       previewSvgContainerRef.current.innerHTML = ""
       if (barcodes.length > 0) {
@@ -78,7 +82,6 @@ export default function Production() {
       }
     }
 
-    // render each canvas (canvases attached in JSX)
     for (let i = 0; i < barcodes.length; i++) {
       const c = canvasListRef.current[i]
       if (c) {
@@ -92,189 +95,85 @@ export default function Production() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [barcodes])
 
-  // persist UI state (current run id and codes) on beforeunload
-  useEffect(() => {
-    const saveState = () => {
-      if (run && run._id) {
-        localStorage.setItem("bb_production_run_id", run._id)
-        localStorage.setItem("bb_production_codes", JSON.stringify(barcodes))
-        localStorage.setItem("bb_production_selected", selected)
-        localStorage.setItem("bb_production_quantity", String(quantity))
-      }
-    }
-    window.addEventListener("beforeunload", saveState)
-    return () => window.removeEventListener("beforeunload", saveState)
-  }, [run, barcodes, selected, quantity])
-
-  // safe helper to decide if a raw run id from storage is valid
-  function safeRunId(raw) {
-    if (!raw) return null
-    if (raw === "undefined" || raw === "null") return null
-    return raw
-  }
-
-  // rehydrate from localStorage on mount — fetch run from server if we have an id
-  useEffect(() => {
-    let mounted = true
-    async function rehydrate() {
-      const rawRunId = localStorage.getItem("bb_production_run_id")
-      const runId = safeRunId(rawRunId)
-      const codes = localStorage.getItem("bb_production_codes")
-      const sel = localStorage.getItem("bb_production_selected")
-      const qty = localStorage.getItem("bb_production_quantity")
-
-      if (sel) setSelected(sel)
-      if (qty) setQuantity(Number(qty))
-      if (codes) {
-        try {
-          const parsed = JSON.parse(codes)
-          if (parsed && parsed.length) setBarcodeText(parsed[0].split("-")[0])
-        } catch (e) {
-          // ignore
-        }
-      }
-
-      if (runId) {
-        try {
-          const fresh = await api.get(`/production/${runId}`)
-          if (!mounted) return
-          if (fresh) {
-            setRun(normalizeRun(fresh))
-            startPolling(fresh._id)
-          } else {
-            // cleanup stale localStorage
-            localStorage.removeItem("bb_production_run_id")
-          }
-        } catch (e) {
-          console.error("Failed to rehydrate run", e)
-          // clear stale id so we don't keep hitting server with invalid id
-          localStorage.removeItem("bb_production_run_id")
-        }
-      }
-    }
-    rehydrate()
-    return () => {
-      mounted = false
-      stopPolling()
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  // polling helpers
-  function startPolling(id) {
-    stopPolling()
-    if (!id) return
-    pollingRef.current = setInterval(async () => {
-      try {
-        const fresh = await api.get(`/production/${id}`)
-        if (fresh) setRun(normalizeRun(fresh))
-      } catch (e) {
-        console.warn("Polling error, stopping poll", e)
-        // if the run is gone, clean up
-        try {
-          const status = e?.status || e?.response?.status
-          if (status === 404 || status === 410) {
-            localStorage.removeItem("bb_production_run_id")
-            setRun(null)
-          }
-        } catch {}
-        stopPolling()
-      }
-    }, 4000)
-  }
-  function stopPolling() {
-    if (pollingRef.current) {
-      clearInterval(pollingRef.current)
-      pollingRef.current = null
-    }
-  }
-
-  async function startRun() {
-    if (!selected || !barcodeText) {
-      alert("Select a product and ensure barcode text is set.")
+  function selectItem(item) {
+    if (!item) {
+      setSelectedItemId("")
+      setBarcodeText("")
+      setQuantity(1)
       return
     }
-    const payload = {
-      productId: selected,
-      barcodeText,
-      quantity: Math.max(1, Number(quantity || 1)),
-      codes: barcodes,
+    setSelectedItemId(item._id)
+    const sku = item.productSku || item.sku || (item.product && item.product.sku)
+    const fallback = (item.productName || item.product?.name || "ITEM").replace(/\s+/g, "-").toUpperCase()
+    setBarcodeText(sku || fallback)
+    // prefer piece if present, else weight or quantity
+    const piece = Number(item.piece || 0)
+    const weight = Number(item.weight || 0)
+    const qty = piece > 0 ? piece : weight > 0 ? weight : Number(item.quantity || 1)
+    setQuantity(qty)
+  }
+
+  async function startProduction(item) {
+    if (!item) {
+      alert("Select an incoming item first.")
+      return
     }
+
+    const payload = {
+      productId: item.product || item.productId || null,
+      barcodeText: barcodeText || item.productSku || item.sku || item.product?.sku || item.productName || "SKU",
+      quantity: Math.max(1, Number(quantity || item.quantity || item.piece || item.weight || 1)),
+      purchaseItemId: item._id,
+      codes: Array.from({ length: Math.max(1, Number(quantity || item.quantity || item.piece || item.weight || 1)) }, (_, i) => `${(barcodeText || item.productSku || item.productName || "CODE")}-${String(i + 1).padStart(3, "0")}`)
+    }
+
     try {
       const res = await api.post("/production/start", payload)
       if (!res || !res._id) throw new Error("Invalid response from server")
-      localStorage.setItem("bb_production_run_id", res._id)
-      setRun(normalizeRun(res))
-      startPolling(res._id)
-      alert("Production run started. Proceed through steps.")
+      await Promise.all([loadActiveRuns(), loadPurchaseItems()])
+      alert("Production started for selected item.")
     } catch (err) {
-      console.error("Failed to start run", err)
-      alert("Failed to start production run. Check server or network.")
+      console.error("Failed to start production", err)
+      alert("Failed to start production. Check server logs.")
     }
   }
 
-  // ---- FIXED completeStep: fallback to api.post if api.patch missing ----
-  async function completeStep(stepIndex) {
-    if (!run?._id) {
-      console.warn("No run id available; clearing local state.")
-      localStorage.removeItem("bb_production_run_id")
-      setRun(null)
-      return
-    }
-
+  async function completeStep(runId, stepIndex) {
     try {
-      // prefer patch but fall back to post (keeps compatibility with varied api.js)
       const methodFn = typeof api.patch === "function" ? api.patch : api.post
-      const updated = await methodFn(`/production/${run._id}/complete-step`, { index: stepIndex })
-
+      const updated = await methodFn(`/production/${runId}/complete-step`, { index: stepIndex })
       if (updated) {
-        setRun(normalizeRun(updated))
-      } else {
-        console.warn("No response returned when completing step")
+        await loadActiveRuns()
       }
     } catch (err) {
       console.error("Failed to complete step", err)
-      const status = err?.status || err?.response?.status
-      if (status === 404 || status === 410) {
-        localStorage.removeItem("bb_production_run_id")
-        setRun(null)
-        stopPolling()
-        alert("Production run no longer exists on server.")
-      } else {
-        alert("Failed to complete step. Check server logs.")
-      }
+      alert("Failed to complete step.")
     }
   }
-  // ---------------------------------------------------------------------
 
-  async function finishRun() {
-    if (!run?._id) {
-      alert("No active run to finish.")
-      return
-    }
+  async function finishRun(runId) {
     try {
-      const updated = await api.post(`/production/${run._id}/finish`, { codes: barcodes })
+      const updated = await api.post(`/production/${runId}/finish`, {})
       if (updated) {
-        setRun(normalizeRun(updated))
-        // cleanup
-        localStorage.removeItem("bb_production_run_id")
-        localStorage.removeItem("bb_production_codes")
-        stopPolling()
-        alert("Production complete and inventory updated.")
-      } else {
-        throw new Error("No response from server")
+        await Promise.all([loadActiveRuns(), loadPurchaseItems()])
+        alert("Production finished and inventory updated.")
       }
     } catch (err) {
       console.error("Failed to finish run", err)
-      const status = err?.status || err?.response?.status
-      if (status === 404 || status === 410) {
-        localStorage.removeItem("bb_production_run_id")
-        setRun(null)
-        stopPolling()
-        alert("Production run not found on server.")
-      } else {
-        alert("Failed to finish production. Check server or network.")
-      }
+      const msg = err?.message || "Failed to finish production."
+      alert(msg)
+    }
+  }
+
+  async function markNoProduction(item) {
+    if (!item) return
+    if (!confirm("Mark this purchase item as NO production required?")) return
+    try {
+      await api.post(`/purchases/${item._id}/mark-no-production`)
+      await loadPurchaseItems()
+    } catch (err) {
+      console.error("Failed to mark no production", err)
+      alert("Failed to mark item.")
     }
   }
 
@@ -285,9 +184,7 @@ export default function Production() {
       return
     }
     w.document.write("<html><head><title>Barcodes</title>")
-    w.document.write(
-      "<style>body{font-family:sans-serif} .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;padding:16px}</style>",
-    )
+    w.document.write("<style>body{font-family:sans-serif} .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;padding:16px}</style>")
     w.document.write("</head><body>")
     w.document.write("<div class='grid'>")
     canvasListRef.current.forEach((c) => {
@@ -316,7 +213,7 @@ export default function Production() {
     let x = margin
     let y = margin
 
-    canvasListRef.current.forEach((c, idx) => {
+    canvasListRef.current.forEach((c) => {
       if (!c) return
       try {
         const img = c.toDataURL("image/png")
@@ -333,129 +230,172 @@ export default function Production() {
           }
         }
       } catch (e) {
-        // ignore per-canvas errors
+        // ignore
       }
     })
-    const p = products.find((p) => p._id === selected)
-    doc.save(`barcodes-${p?.sku || "SKU"}-x${barcodes.length}.pdf`)
+    const p = purchaseItems.find((p) => p._id === selectedItemId)
+    doc.save(`barcodes-${p?.productSku || p?.sku || "SKU"}-x${barcodes.length}.pdf`)
+  }
+
+  function renderPurchaseItemLine(item) {
+    const hasSymbol = !!item.hasSymbol
+    const invoiceNo = item.invoiceNumber || item.invoice || "—"
+    const invoiceDate = item.invoiceDate ? new Date(item.invoiceDate).toLocaleDateString() : item.createdAt ? new Date(item.createdAt).toLocaleDateString() : "—"
+    const piece = Number(item.piece || 0)
+    const weight = Number(item.weight || 0)
+    // prefer pieces display
+    const qtyDisplay = piece > 0 ? `Pieces: ${piece}` : weight > 0 ? `Weight: ${weight}` : `Qty: ${Number(item.quantity || 0)}`
+    const symbolText = hasSymbol ? "With symbol" : "Without symbol"
+
+    return (
+      <div key={item._id} className="border rounded p-3 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+        <div className="flex-1">
+          <div className="font-semibold">{item.productName || item.product?.name || "Unnamed product"}</div>
+
+          {item.productSku ? (
+            <div className="text-sm">SKU: {item.productSku || item.sku || item.product?.sku}</div>
+          ) : (
+            <div className="text-sm">Invoice: {invoiceNo} • Date: {invoiceDate}</div>
+          )}
+
+          <div className="text-sm">
+            {qtyDisplay}
+          </div>
+
+          {item.rate ? <div className="text-sm">Price: {item.rate}</div> : null}
+          {item.description ? <div className="text-xs mt-1">{item.description}</div> : null}
+          <div className="text-xs mt-1">Status: {item.status}</div>
+          <div className="text-xs mt-1">Symbol: {symbolText}</div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <button className="border rounded px-3 py-2" onClick={() => selectItem(item)}>Select</button>
+
+          <button
+            className="border rounded px-3 py-2"
+            onClick={() => startProduction(item)}
+            disabled={item.status === "produced" || item.status === "in_production"}
+            title={item.status === "in_production" ? "Already in production" : ""}
+          >
+            Start Production
+          </button>
+
+          <button className="border rounded px-3 py-2" onClick={() => markNoProduction(item)}>
+            No Production Required
+          </button>
+        </div>
+      </div>
+    )
   }
 
   return (
     <div className="grid gap-4">
+      {/* Incoming purchase items */}
       <div className="card p-4">
-        <h3 className="text-lg font-semibold mb-3">Generate Barcodes & Start Production</h3>
-        <div className="grid md:grid-cols-2 gap-4">
-          <div className="field">
-            <label className="block text-sm mb-1">Search Product</label>
-            <input
-              type="text"
-              className="w-full border rounded px-3 py-2"
-              placeholder="Type name or SKU to filter…"
-              value={productQuery}
-              onChange={(e) => setProductQuery(e.target.value)}
-            />
-          </div>
-          <div className="field">
-            <label className="block text-sm mb-1">Product</label>
-            <select
-              className="w-full border rounded px-3 py-2"
-              value={selected}
-              onChange={(e) => setSelected(e.target.value)}
-            >
-              <option value="">Select product</option>
-              {filteredProducts.map((p) => (
-                <option key={p._id} value={p._id}>
-                  {p.name} {p.sku ? `(${p.sku})` : ""}
-                </option>
-              ))}
-            </select>
-          </div>
+        <h3 className="text-lg font-semibold mb-3">Incoming Purchase Items (Production)</h3>
 
-          <div className="field">
-            <label className="block text-sm mb-1">Quantity</label>
-            <input
-              type="number"
-              min="1"
-              className="w-full border rounded px-3 py-2"
-              value={quantity}
-              onChange={(e) => setQuantity(Number(e.target.value || 1))}
-            />
-          </div>
-
-          <div className="card border p-4 md:col-span-2">
-            <div className="flex items-start justify-between">
-              <div>
-                <div className="badge mb-2">Preview (first)</div>
-                <div ref={previewSvgContainerRef} />
-              </div>
-              <div className="flex gap-2">
-                <button className="border rounded px-3 py-2 cursor-pointer" onClick={printAllBarcodes}>
-                  Print All
-                </button>
-                <button className="border rounded px-3 py-2 cursor-pointer" onClick={saveAllBarcodesPDF}>
-                  Save All PDF
-                </button>
-              </div>
-            </div>
-
-            {/* hidden canvases used for printing/PDF */}
-            <div className="sr-only" aria-hidden="true">
-              {barcodes.map((code, i) => (
-                <canvas key={code} ref={(el) => (canvasListRef.current[i] = el)} />
-              ))}
-            </div>
-          </div>
-
-          <button
-            disabled={!selected}
-            onClick={startRun}
-            className="border rounded px-3 py-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            Start Production
-          </button>
+        <div className="space-y-3">
+          {purchaseItems.length === 0 ? (
+            <div className="text-sm text-muted">No incoming purchase items requiring production.</div>
+          ) : (
+            purchaseItems.map((it) => renderPurchaseItemLine(it))
+          )}
         </div>
       </div>
 
+      {/* Barcode generation */}
       <div className="card p-4">
-        <h3 className="text-lg font-semibold mb-3">Production Steps</h3>
-        {!run ? (
-          <div>Select a product and start a run.</div>
+        <h3 className="text-lg font-semibold mb-3">Barcode Generation</h3>
+
+        {!selectedItemId ? (
+          <div>Select an incoming item to generate barcodes and start production.</div>
         ) : (
           <>
-            {/* Product title */}
-            <div className="mb-3">
-              <div className="badge">Run: {run._id}</div>
-              <div className="mt-1 font-semibold">
-                Producing:{" "}
-                {run?.product?.name || products.find((p) => p._id === (run?.productId || selected))?.name || "Product"}{" "}
-                {run?.product?.sku || products.find((p) => p._id === (run?.productId || selected))?.sku
-                  ? `(${run?.product?.sku || products.find((p) => p._id === (run?.productId || selected))?.sku})`
-                  : ""}
+            <div className="grid md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm mb-1">Barcode text</label>
+                <input value={barcodeText} onChange={(e) => setBarcodeText(e.target.value)} className="w-full border rounded px-3 py-2" />
+              </div>
+
+              <div>
+                <label className="block text-sm mb-1">Quantity</label>
+                <input type="number" min="1" value={quantity} onChange={(e) => setQuantity(Number(e.target.value || 1))} className="w-full border rounded px-3 py-2" />
+              </div>
+
+              <div className="card border p-4 md:col-span-2">
+                <div className="flex items-start justify-between">
+                  <div>
+                    <div className="badge mb-2">Preview (first)</div>
+                    <div ref={previewSvgContainerRef} />
+                  </div>
+                  <div className="flex gap-2">
+                    <button className="border rounded px-3 py-2" onClick={printAllBarcodes}>Print All</button>
+                    <button className="border rounded px-3 py-2" onClick={saveAllBarcodesPDF}>Save All PDF</button>
+                  </div>
+                </div>
+
+                <div className="sr-only" aria-hidden="true">
+                  {barcodes.map((code, i) => (
+                    <canvas key={code} ref={(el) => (canvasListRef.current[i] = el)} />
+                  ))}
+                </div>
               </div>
             </div>
-            <ol className="space-y-2">
-              {(run?.steps || []).map((s, i) => (
-                <li key={i} className="flex items-center justify-between">
-                  <span>{s.name}</span>
-                  <div className="flex items-center gap-2">
-                    <span className="badge">{s.completedAt ? "Done" : "Pending"}</span>
-                    {!s.completedAt && (
-                      <button className="border rounded px-3 py-2 cursor-pointer" onClick={() => completeStep(i)}>
-                        Complete Step
-                      </button>
-                    )}
-                  </div>
-                </li>
-              ))}
-            </ol>
-            <button
-              onClick={finishRun}
-              disabled={(run?.steps || []).some((s) => !s.completedAt)}
-              className="mt-3 border rounded px-3 py-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              Finish Production
-            </button>
           </>
+        )}
+      </div>
+
+      {/* Active production runs */}
+      <div className="card p-4">
+        <h3 className="text-lg font-semibold mb-3">Active Production Runs</h3>
+
+        {activeRuns.length === 0 ? (
+          <div>No active production runs.</div>
+        ) : (
+          activeRuns.map((run) => {
+            const pi = run.purchaseItem || {}
+            const invoiceNo = pi.invoiceNumber || "—"
+            const invoiceDate = pi.invoiceDate ? new Date(pi.invoiceDate).toLocaleDateString() : "—"
+            // piece/weight fallback: prefer purchaseItem fields, else run fields
+            const piece = Number(pi.piece || run.piece || 0)
+            const weight = Number(pi.weight || run.weight || 0)
+            const symbolText = pi.hasSymbol ? "With symbol" : "Without symbol"
+
+            return (
+              <div key={run._id} className="border rounded p-3 mb-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="font-semibold">Run: {run._id}</div>
+                    <div className="text-sm">Producing: {run.product?.name || run.productName || "Product"} {run.product?.sku ? `(${run.product.sku})` : ""}</div>
+                    <div className="text-sm">Invoice: {invoiceNo} • Date: {invoiceDate}</div>
+                    <div className="text-sm">Pieces: {piece} • Weight: {weight}</div>
+                    <div className="text-sm">Symbol: {symbolText}</div>
+                  </div>
+
+                  <div className="flex flex-col items-end gap-2">
+                    <div className="text-xs text-muted">Status: {run.status}</div>
+                    <button className="border rounded px-3 py-2" onClick={() => finishRun(run._id)} disabled={(run.steps || []).some((s) => !s.completedAt)}>
+                      Finish
+                    </button>
+                  </div>
+                </div>
+
+                <ol className="mt-3 space-y-2">
+                  {(run.steps || []).map((s, i) => (
+                    <li key={i} className="flex items-center justify-between">
+                      <span>{s.name}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="badge">{s.completedAt ? "Done" : "Pending"}</span>
+                        {!s.completedAt && (
+                          <button className="border rounded px-3 py-2" onClick={() => completeStep(run._id, i)}>Complete Step</button>
+                        )}
+                      </div>
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            )
+          })
         )}
       </div>
     </div>

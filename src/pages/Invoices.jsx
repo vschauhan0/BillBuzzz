@@ -18,13 +18,18 @@ export default function Invoices() {
 
   async function openFullEdit(inv) {
     setFullEditId(inv._id);
+
+    // Preserve invoiceItemId if present on invoice items/xlItems so server can match them on PUT.
     setFullEditData({
       number: inv.number,
       date: inv.date?.slice(0, 10) || new Date().toISOString().slice(0, 10),
       type: inv.type,
       customerId: inv.customer?._id || inv.customerId || "",
-      items: inv.items.map((it) => ({
+      items: (inv.items || []).map((it) => ({
+        // local UI id for array rendering (not the server invoiceItemId)
         id: crypto.randomUUID(),
+        // crucial: preserve invoiceItemId if it exists (server uses it to match PurchaseItems)
+        invoiceItemId: it.invoiceItemId || undefined,
         productId: it.product?._id || it.productId || "",
         pieceWithout: it.pieceWithout || 0,
         weightWithout: it.weightWithout || 0,
@@ -37,18 +42,25 @@ export default function Invoices() {
         itemDate: it.itemDate
           ? it.itemDate.slice(0, 10)
           : inv.date.slice(0, 10),
+        description: it.description || "",
+        productName: it.productName || it.product?.name || "",
+        productSku: it.productSku || it.product?.sku || "",
       })),
       xlItems:
-        inv.xlItems?.map((x) => ({
+        (inv.xlItems || []).map((x) => ({
           id: crypto.randomUUID(),
+          invoiceItemId: x.invoiceItemId || undefined,
           productId: x.product?._id || x.productId || "",
           piece: x.piece || 0,
           weight: x.weight || 0,
           rate: x.rate || 0,
-          rateType: x.rateType || "piece",
+          rateType: x.rateType || "weight",
           itemDate: x.itemDate
             ? x.itemDate.slice(0, 10)
             : inv.date.slice(0, 10),
+          description: x.description || "",
+          productName: x.productName || x.product?.name || "",
+          productSku: x.productSku || x.product?.sku || "",
         })) || [],
     });
   }
@@ -61,12 +73,15 @@ export default function Invoices() {
         return;
       }
 
+      // Build payload and include invoiceItemId when present so server can detect existing items
       const payload = {
         number: fullEditData.number,
         date: fullEditData.date,
         type: fullEditData.type,
         customerId: fullEditData.customerId,
-        items: fullEditData.items.map((it) => ({
+        items: (fullEditData.items || []).map((it) => ({
+          // include invoiceItemId if this was an existing invoice line; omit/undefined for brand-new lines
+          invoiceItemId: it.invoiceItemId || undefined,
           productId: it.productId,
           pieceWithout: it.pieceWithout,
           weightWithout: it.weightWithout,
@@ -77,16 +92,23 @@ export default function Invoices() {
           rateWith: it.rateWith,
           rateTypeWith: it.rateTypeWith || "piece",
           itemDate: it.itemDate,
+          description: it.description || "",
+          // also pass friendly fallbacks so server has full context
+          productName: it.productName || undefined,
+          productSku: it.productSku || undefined,
         })),
-        xlItems:
-          fullEditData.xlItems?.map((x) => ({
-            productId: x.productId,
-            piece: x.piece,
-            weight: x.weight,
-            rate: x.rate,
-            rateType: x.rateType || "piece",
-            itemDate: x.itemDate,
-          })) || [],
+        xlItems: (fullEditData.xlItems || []).map((x) => ({
+          invoiceItemId: x.invoiceItemId || undefined,
+          productId: x.productId,
+          piece: x.piece,
+          weight: x.weight,
+          rate: x.rate,
+          rateType: x.rateType || "piece",
+          itemDate: x.itemDate,
+          description: x.description || "",
+          productName: x.productName || undefined,
+          productSku: x.productSku || undefined,
+        })),
       };
 
       await api.put(`/invoices/${id}`, payload);
@@ -94,7 +116,7 @@ export default function Invoices() {
       load();
     } catch (err) {
       console.error("[v0] Save full edit error:", err);
-      alert("Error saving invoice: " + err.message);
+      alert("Error saving invoice: " + (err.message || err));
     }
   }
 
@@ -110,12 +132,15 @@ export default function Invoices() {
   }
 
   function addFullEditItem() {
+    // new items should NOT have invoiceItemId so server knows they're new
+    const newLocalId = crypto.randomUUID();
     setFullEditData((prev) => ({
       ...prev,
       items: [
         ...prev.items,
         {
-          id: crypto.randomUUID(),
+          id: newLocalId,
+          invoiceItemId: undefined,
           productId: "",
           pieceWithout: 0,
           weightWithout: 0,
@@ -125,7 +150,10 @@ export default function Invoices() {
           weightWith: 0,
           rateWith: 0,
           rateTypeWith: "piece",
-          itemDate: fullEditData.date,
+          itemDate: prev.date,
+          description: "",
+          productName: "",
+          productSku: "",
         },
       ],
     }));
@@ -247,7 +275,7 @@ export default function Invoices() {
     );
     const grandTotal = totalWithout + totalWith + xlTotal;
 
-    const itemsHtml = inv.items
+    const itemsHtml = (inv.items || [])
       .map((it, idx) => {
         const itemDate = it.itemDate
           ? new Date(it.itemDate).toLocaleDateString()
@@ -261,10 +289,12 @@ export default function Invoices() {
             ? Number(it.rateWith || 0) * Number(it.weightWith || 0)
             : Number(it.rateWith || 0) * Number(it.pieceWith || 0);
 
+        const name = it.productName || (it.product && it.product.name) || "";
+
         return `<tr>
           <td>${idx + 1}</td>
           <td>${itemDate}</td>
-          <td>${it.product?.name || ""}</td>
+          <td>${name}</td>
           <td style="text-align:right">${Number(it.pieceWithout || 0).toFixed(
             2
           )}</td>
@@ -298,12 +328,14 @@ export default function Invoices() {
           x.rateType === "weight"
             ? Number(x.rate || 0) * Number(x.weight || 0)
             : Number(x.rate || 0) * Number(x.piece || 0);
+
+        // Label XL items using productName fallback
+        const xlLabel = `XL - ${x.productName || (x.product && x.product.name) || ""}`;
+
         return `<tr style="background-color: #fef3c7">
-          <td>${inv.items.length + idx + 1}</td>
+          <td>${(inv.items || []).length + idx + 1}</td>
           <td>${itemDate}</td>
-          <td>XL - ${
-            inv.products?.find((p) => p._id === x.productId)?.name || ""
-          }</td>
+          <td>${xlLabel}</td>
           <td style="text-align:right">-</td>
           <td style="text-align:right">-</td>
           <td style="text-align:right">-</td>
@@ -343,14 +375,8 @@ export default function Invoices() {
             ${logoImg ? `<img src="${logoImg}" alt="Logo" class="logo" />` : ""}
             <div class="title">${profile?.firmName || "Your Company"}</div>
             <div class="muted">${profile?.address || ""}</div>
-            <div class="muted">${profile?.phone || ""}${
-      profile?.email ? " · " + profile?.email : ""
-    }</div>
-            ${
-              profile?.gstin
-                ? `<div class="muted">GSTIN: ${profile.gstin}</div>`
-                : ""
-            }
+            <div class="muted">${profile?.phone || ""}${profile?.email ? " · " + profile?.email : ""}</div>
+            ${ profile?.gstin ? `<div class="muted">GSTIN: ${profile.gstin}</div>` : "" }
           </div>
 
           <h2 style="margin-top:16px">INVOICE</h2>
@@ -360,15 +386,11 @@ export default function Invoices() {
               <div><strong>Bill To</strong></div>
               <div>${custFirm}</div>
               <div class="muted">${custAddr}</div>
-              <div class="muted">${custPhone}${
-      custEmail ? " · " + custEmail : ""
-    }</div>
+              <div class="muted">${custPhone}${custEmail ? " · " + custEmail : ""}</div>
             </div>
             <div class="box" style="width: 320px">
               <div><strong>Invoice #</strong> ${inv.number}</div>
-              <div><strong>Date</strong> ${new Date(
-                inv.date
-              ).toLocaleDateString()}</div>
+              <div><strong>Date</strong> ${new Date(inv.date).toLocaleDateString()}</div>
               <div><strong>Type</strong> ${inv.type}</div>
             </div>
           </div>
@@ -400,19 +422,10 @@ export default function Invoices() {
                 <td colspan="3" style="text-align:right">Total (With)</td>
                 <td style="text-align:right">${totalWith.toFixed(2)}</td>
               </tr>
-              ${
-                xlTotal > 0
-                  ? `<tr class="subtotal-row">
-                <td colspan="10" style="text-align:right">Total (XL)</td>
-                <td style="text-align:right">${xlTotal.toFixed(2)}</td>
-              </tr>`
-                  : ""
-              }
+              ${ xlTotal > 0 ? `<tr class="subtotal-row"><td colspan="10" style="text-align:right">Total (XL)</td><td style="text-align:right">${xlTotal.toFixed(2)}</td></tr>` : "" }
               <tr class="subtotal-row">
                 <td colspan="10" style="text-align:right"><strong>Grand Total</strong></td>
-                <td style="text-align:right"><strong>${grandTotal.toFixed(
-                  2
-                )}</strong></td>
+                <td style="text-align:right"><strong>${grandTotal.toFixed(2)}</strong></td>
               </tr>
             </tfoot>
           </table>
@@ -834,12 +847,16 @@ export default function Invoices() {
                       ...(prev.xlItems || []),
                       {
                         id: crypto.randomUUID(),
+                        invoiceItemId: undefined,
                         productId: "",
                         piece: 0,
                         weight: 0,
                         rate: 0,
                         rateType: "piece",
                         itemDate: fullEditData.date,
+                        description: "",
+                        productName: "",
+                        productSku: "",
                       },
                     ],
                   }))

@@ -1,11 +1,21 @@
-import mongoose from "mongoose"
+// models/Inventory.js
+import mongoose from "mongoose";
 
 const inventorySchema = new mongoose.Schema(
   {
     product: { type: mongoose.Schema.Types.ObjectId, ref: "Product", required: true },
-    quantity: { type: Number, default: 0 },
+    pieceQuantity: { type: Number, default: 0 }, // pieces count
+    weightQuantity: { type: Number, default: 0 }, // weight (kg or whatever unit you use)
   },
-  { timestamps: true },
-)
+  { timestamps: true }
+);
 
-export const Inventory = mongoose.model("Inventory", inventorySchema)
+inventorySchema.virtual("displayQuantity").get(function () {
+  // helper virtual: if pieces exist, return pieces, else return weight
+  return {
+    pieces: this.pieceQuantity,
+    weight: this.weightQuantity,
+  };
+});
+
+export const Inventory = mongoose.model("Inventory", inventorySchema);
