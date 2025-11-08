@@ -1,725 +1,704 @@
 // routes/invoices.js
-import { Router } from "express"
-import mongoose from "mongoose"
-import { Invoice } from "../models/Invoice.js"
-import { Inventory } from "../models/Inventory.js"
-import { PurchaseItem } from "../models/PurchaseItem.js"
+import { Router } from "express";
+import mongoose from "mongoose";
+import { Invoice } from "../models/Invoice.js";
+import { Inventory } from "../models/Inventory.js";
+import { PurchaseItem } from "../models/PurchaseItem.js";
+import { Product } from "../models/Product.js";
+import { ProductionRun } from "../models/ProductionRun.js";
 
-const router = Router()
-
-async function nextNumber() {
-  const last = await Invoice.findOne().sort({ number: -1 }).lean()
-  return (last?.number || -1) + 1
-}
-
-function extractProductId(product) {
-  if (!product && product !== 0) return null
-  if (typeof product === "string") return product
-  if (product && product._id) return String(product._id)
-  try {
-    return String(product)
-  } catch {
-    return null
-  }
-}
-
-function makeInvoiceItemId() {
-  return String(new mongoose.Types.ObjectId())
-}
-
-/** Helper: build a consistent sub-id for invoice item subrows */
-function subId(parentInvoiceItemId, suffix) {
-  return `${parentInvoiceItemId}|${suffix}`
-}
+const router = Router();
 
 /**
- * Compute canonical quantity for an invoice line (normal or XL)
- * - If the incoming object explicitly has `quantity` use it.
- * - For normal invoice items (with/without), choose piece or weight based on rateType field.
- * - For XL items, use rateType similarly.
- * Returns a non-negative Number (0 if none).
+ * nextNumber(date) -> next invoice number for a given financial year across ALL types.
+ * FY = Apr 1 - Mar 31
+ * Returns integer starting at 1 for the FY (mixed sequence sale+purchase).
  */
-function computeQuantityFromInvoiceLine(line = {}, isXL = false) {
-  if (!line) return 0
-  const explicit = Number(line.quantity || 0)
-  if (explicit > 0) return explicit
+async function nextNumber(dateObj = new Date()) {
+  const d = new Date(dateObj);
+  const year = d.getMonth() >= 3 ? d.getFullYear() : d.getFullYear() - 1;
+  const fyStart = new Date(year, 3, 1, 0, 0, 0, 0);
+  const fyEnd = new Date(year + 1, 2, 31, 23, 59, 59, 999);
 
-  if (isXL) {
-    const piece = Number(line.piece || 0)
-    const weight = Number(line.weight || 0)
-    if (line.rateType === "weight") return weight > 0 ? weight : 0
-    return piece > 0 ? piece : 0
-  } else {
-    // normal invoice item may have separate with/without parts.
-    // When used individually, caller will pass the correct sub-object. Here we just handle a single subline.
-    const piece = Number(line.piece || 0)
-    const weight = Number(line.weight || 0)
-    if (line.rateType === "weight") return weight > 0 ? weight : 0
-    return piece > 0 ? piece : 0
-  }
+  const filter = { date: { $gte: fyStart, $lte: fyEnd } };
+  const last = await Invoice.findOne(filter).sort({ number: -1 }).lean();
+
+  return (last && Number.isInteger(Number(last.number))) ? (Number(last.number) + 1) : 1;
 }
 
-/** Convert items and xlItems into a product->quantity map (quantity uses pieces or weight depending on rateType) */
+/* ----------------- helpers ----------------- */
+
+function extractProductId(product) {
+  if (!product && product !== 0) return null;
+  if (typeof product === "string") return product;
+  if (product && product._id) return String(product._id);
+  try { return String(product); } catch { return null; }
+}
+
+function makeInvoiceItemId() { return String(new mongoose.Types.ObjectId()); }
+function subId(parentInvoiceItemId, suffix) { return `${parentInvoiceItemId}|${suffix}`; }
+
+function computeQuantityFromInvoiceLine(line = {}, isXL = false) {
+  if (!line) return 0;
+  const explicit = Number(line.quantity || 0);
+  if (explicit > 0) return explicit;
+  const piece = Number(line.piece || 0);
+  const weight = Number(line.weight || 0);
+  const rtype = line.rateType || "piece";
+  if (rtype === "weight") return weight > 0 ? weight : 0;
+  return piece > 0 ? piece : 0;
+}
+
 function quantitiesFromItems(items = [], xlItems = []) {
-  const map = new Map()
-  function add(productId, qty) {
-    if (!productId) return
-    const key = String(productId)
-    map.set(key, (map.get(key) || 0) + Number(qty || 0))
+  const map = new Map();
+  function addComposite(productId, hasSymbol, qty) {
+    if (!productId) return;
+    const key = `${String(productId)}::${hasSymbol ? "with" : "without"}`;
+    map.set(key, (map.get(key) || 0) + Number(qty || 0));
   }
 
-  // items here are the invoice-level items which contain both without/with subvalues.
-  items.forEach((it) => {
-    const pid = extractProductId(it.product || it.productId)
-    if (!pid) return
-
-    // compute quantity for "without" subrow
+  (items || []).forEach((it) => {
+    const pid = extractProductId(it.product || it.productId);
+    if (!pid) return;
     const withoutLine = {
       piece: Number(it.pieceWithout || 0),
       weight: Number(it.weightWithout || 0),
       rateType: it.rateTypeWithout || "piece",
       quantity: Number(it.quantityWithout || 0),
-    }
-    const withoutQty = computeQuantityFromInvoiceLine(withoutLine, false)
-
-    // compute quantity for "with" subrow
+    };
     const withLine = {
       piece: Number(it.pieceWith || 0),
       weight: Number(it.weightWith || 0),
       rateType: it.rateTypeWith || "piece",
       quantity: Number(it.quantityWith || 0),
-    }
-    const withQty = computeQuantityFromInvoiceLine(withLine, false)
+    };
+    const withoutQty = computeQuantityFromInvoiceLine(withoutLine, false);
+    const withQty = computeQuantityFromInvoiceLine(withLine, false);
+    if (withoutQty > 0) addComposite(pid, false, withoutQty);
+    if (withQty > 0) addComposite(pid, true, withQty);
+  });
 
-    add(pid, (withoutQty || 0) + (withQty || 0))
-  })
-
-  xlItems.forEach((x) => {
-    const pid = extractProductId(x.product || x.productId)
-    if (!pid) return
-    const xlLine = {
+  (xlItems || []).forEach((x) => {
+    const pid = extractProductId(x.product || x.productId);
+    if (!pid) return;
+    const line = {
       piece: Number(x.piece || 0),
       weight: Number(x.weight || 0),
       rateType: x.rateType || "weight",
       quantity: Number(x.quantity || 0),
-    }
-    const xlQty = computeQuantityFromInvoiceLine(xlLine, true)
-    add(pid, xlQty || 0)
-  })
+    };
+    const qty = computeQuantityFromInvoiceLine(line, true);
+    if (qty > 0) addComposite(pid, !!x.productSku, qty);
+  });
 
-  const out = {}
-  for (const [k, v] of map.entries()) out[k] = v
-  return out
+  const out = {};
+  for (const [k, v] of map.entries()) out[k] = v;
+  return out;
 }
 
-/** Apply inventory deltas map { productId: delta }.
- *  This increments quantity by delta (positive adds stock, negative reduces).
- */
 async function applyInventoryDeltas(deltas = {}) {
-  const entries = Object.entries(deltas || {})
-  if (!entries.length) return
-  const promises = entries.map(async ([productId, delta]) => {
-    const d = Number(delta || 0)
-    if (!d) return
-    let pid = productId
-    try {
-      if (mongoose.Types.ObjectId.isValid(pid)) pid = mongoose.Types.ObjectId(pid)
-    } catch {
-      pid = productId
+  const entries = Object.entries(deltas || {});
+  if (!entries.length) return;
+  const promises = entries.map(async ([key, delta]) => {
+    const d = Number(delta || 0);
+    if (!d) return;
+    let pid = key; let hasSymbol = false;
+    if (String(key).includes("::")) {
+      const [p, sym] = String(key).split("::");
+      pid = p; hasSymbol = sym === "with";
     }
-    await Inventory.findOneAndUpdate(
-      { product: pid },
-      { $inc: { quantity: d }, $setOnInsert: { product: pid } },
-      { upsert: true, new: true }
-    )
-  })
-  await Promise.all(promises)
+    try { if (mongoose.Types.ObjectId.isValid(pid)) pid = mongoose.Types.ObjectId(pid); } catch {}
+    const isPiece = Number.isInteger(d);
+    const pieces = isPiece ? d : 0;
+    const weight = !isPiece ? d : 0;
+    try {
+      await Inventory.increment(pid, { pieces, weight, hasSymbol: !!hasSymbol });
+    } catch (err) {
+      console.warn("applyInventoryDeltas: Inventory.increment failed for", pid, hasSymbol, d, err);
+    }
+  });
+  await Promise.all(promises);
 }
 
-/** GET / - list invoices */
-router.get("/", async (_req, res) => {
-  try {
-    const rows = await Invoice.find()
-      .populate("customer")
-      .populate("items.product")
-      .populate("xlItems.product")
-      .sort({ createdAt: -1 })
-    res.json(rows)
-  } catch (err) {
-    console.error("[Invoice List Error]", err)
-    res.status(500).json({ message: "Server Error: " + err.message })
-  }
-})
+/* =========================
+   Product coercion + builders
+   ========================= */
 
-/**
- * When creating a PurchaseItem row, use the same quantity logic.
- * Accept a PI-like object and compute a safe PurchaseItem payload.
- */
-function buildPurchaseItemPayload({
-  invoiceNumber,
-  invDate,
-  invoiceItemId,
-  invoiceParentItemId,
-  product,
-  productName,
-  productSku,
-  piece,
-  weight,
-  quantity,
-  rate,
-  description,
-  hasSymbol,
-  isXL,
-  status,
-}) {
-  const payload = {
-    invoiceNumber,
-    invoiceDate: invDate,
-    invoiceItemId,
-    invoiceParentItemId,
-    product: product || undefined,
+async function coerceProductRefAsync(productCandidate) {
+  if (productCandidate === undefined || productCandidate === null) return undefined;
+
+  if (typeof productCandidate === "object" && productCandidate._id) {
+    const idStr = String(productCandidate._id || "");
+    if (mongoose.Types.ObjectId.isValid(idStr)) return new mongoose.Types.ObjectId(idStr);
+    return undefined;
+  }
+
+  try {
+    if (productCandidate && productCandidate._bsontype === "ObjectID") return productCandidate;
+  } catch (e) {}
+
+  if (typeof productCandidate === "string") {
+    const trimmed = productCandidate.trim();
+    if (!trimmed) return undefined;
+    if (mongoose.Types.ObjectId.isValid(trimmed)) return new mongoose.Types.ObjectId(trimmed);
+
+    let found = await Product.findOne({ sku: trimmed }).lean();
+    if (found) return new mongoose.Types.ObjectId(found._id);
+
+    found = await Product.findOne({ name: trimmed }).lean();
+    if (found) return new mongoose.Types.ObjectId(found._id);
+
+    return undefined;
+  }
+
+  return undefined;
+}
+
+async function buildSafeInvoiceItem(i) {
+  const candidate = i.productId ?? i.product ?? i.productName ?? i.productSku ?? undefined;
+  const coerced = await coerceProductRefAsync(candidate);
+
+  let productName = i.productName;
+  let productSku = i.productSku;
+  if ((!productName || productName === "") && typeof i.product === "object" && i.product?.name) productName = i.product.name;
+  if ((!productSku || productSku === "") && typeof i.product === "object" && i.product?.sku) productSku = i.product.sku;
+
+  return {
+    invoiceItemId: i.invoiceItemId || makeInvoiceItemId(),
+    product: coerced || undefined,
     productName: productName || undefined,
     productSku: productSku || undefined,
-    piece: Number(piece || 0),
-    weight: Number(weight || 0),
-    // quantity: prefer explicit quantity, otherwise piece>0 or weight>0
-    quantity: Number(quantity || 0) || (Number(piece || 0) > 0 ? Number(piece || 0) : Number(weight || 0)),
-    rate: rate !== undefined ? Number(rate || 0) : undefined,
-    description: description || "",
-    hasSymbol: !!hasSymbol,
-    isXL: !!isXL,
-    status: status || "pending",
-  }
-  return payload
+    pieceWithout: Number(i.pieceWithout || 0),
+    weightWithout: Number(i.weightWithout || 0),
+    rateWithout: Number(i.rateWithout || 0),
+    rateTypeWithout: i.rateTypeWithout || "piece",
+    pieceWith: Number(i.pieceWith || 0),
+    weightWith: Number(i.weightWith || 0),
+    rateWith: Number(i.rateWith || 0),
+    rateTypeWith: i.rateTypeWith || "piece",
+    quantityWithout: Number(i.quantityWithout || 0),
+    quantityWith: Number(i.quantityWith || 0),
+    itemDate: i.itemDate,
+    description: i.description || "",
+  };
 }
 
-/** POST / - create invoice (and PurchaseItems for purchase invoices).
- *  Inventory increments for purchase invoices are NOT applied here — they are applied when PurchaseItems
- *  are transitioned to 'produced' or 'no_production' by production endpoints. Sales invoices DO update inventory here.
- */
+async function buildSafeXlItem(x) {
+  const candidate = x.productId ?? x.product ?? x.productName ?? x.productSku ?? undefined;
+  const coerced = await coerceProductRefAsync(candidate);
+
+  let productName = x.productName;
+  let productSku = x.productSku;
+  if ((!productName || productName === "") && typeof x.product === "object" && x.product?.name) productName = x.product.name;
+  if ((!productSku || productSku === "") && typeof x.product === "object" && x.product?.sku) productSku = x.product.sku;
+
+  return {
+    invoiceItemId: x.invoiceItemId || makeInvoiceItemId(),
+    product: coerced || undefined,
+    productName: productName || undefined,
+    productSku: productSku || undefined,
+    piece: Number(x.piece || 0),
+    weight: Number(x.weight || 0),
+    rateType: x.rateType || "weight",
+    rate: Number(x.rate || 0),
+    quantity: Number(x.quantity || 0),
+    itemDate: x.itemDate,
+    description: x.description || "",
+  };
+}
+
+/* ---------------- ROUTES ---------------- */
+
+router.get("/", async (_req, res) => {
+  try {
+    const rows = await Invoice.find().populate("customer").populate("items.product").populate("xlItems.product").sort({ createdAt: -1 });
+    res.json(rows);
+  } catch (err) {
+    console.error("[Invoice List Error]", err);
+    res.status(500).json({ message: "Server Error: " + err.message });
+  }
+});
+
+// NEXT NUMBER endpoint (mixed sequence per FY)
+router.get("/next-number", async (req, res) => {
+  try {
+    const date = req.query.date ? new Date(req.query.date) : new Date();
+    const num = await nextNumber(date);
+    res.json({ nextNumber: num });
+  } catch (err) {
+    console.error("[next-number] error:", err);
+    res.status(500).json({ message: "Server Error: " + err.message });
+  }
+});
+
+/** CREATE invoice */
 router.post("/", async (req, res) => {
   try {
-    const { type, customerId, items = [], xlItems = [], totalWithout, totalWith, xlTotal, date } = req.body
-    const grandTotal = Number(totalWithout || 0) + Number(totalWith || 0) + Number(xlTotal || 0)
+    const { type, customerId, items = [], xlItems = [], date, number: clientNumber, dueDate } = req.body;
 
-    // stable invoiceItemId for every line
-    const safeItems = (items || []).map((i) => ({
-      invoiceItemId: i.invoiceItemId || makeInvoiceItemId(),
-      product: i.productId || i.product,
-      productName: i.productName || (i.product && i.product.name) || undefined,
-      productSku: i.productSku || (i.product && i.product.sku) || undefined,
-      pieceWithout: Number(i.pieceWithout || 0),
-      weightWithout: Number(i.weightWithout || 0),
-      rateWithout: Number(i.rateWithout || 0),
-      rateTypeWithout: i.rateTypeWithout || "piece",
-      pieceWith: Number(i.pieceWith || 0),
-      weightWith: Number(i.weightWith || 0),
-      rateWith: Number(i.rateWith || 0),
-      rateTypeWith: i.rateTypeWith || "piece",
-      // optional explicit quantities (rare) — we accept them
-      quantityWithout: Number(i.quantityWithout || 0),
-      quantityWith: Number(i.quantityWith || 0),
-      itemDate: i.itemDate,
-      description: i.description || "",
-    }))
+    // Build safe items
+    const safeItems = [];
+    for (const it of (items || [])) {
+      const safe = await buildSafeInvoiceItem(it);
+      safeItems.push(safe);
+    }
 
-    const safeXlItems = (xlItems || []).map((x) => ({
-      invoiceItemId: x.invoiceItemId || makeInvoiceItemId(),
-      product: x.productId || x.product,
-      productName: x.productName || (x.product && x.product.name) || undefined,
-      productSku: x.productSku || (x.product && x.product.sku) || undefined,
-      piece: Number(x.piece || 0),
-      weight: Number(x.weight || 0),
-      rateType: x.rateType || "weight",
-      rate: Number(x.rate || 0),
-      quantity: Number(x.quantity || 0),
-      itemDate: x.itemDate,
-      description: x.description || "",
-    }))
+    const safeXlItems = [];
+    for (const x of (xlItems || [])) {
+      const safex = await buildSafeXlItem(x);
+      safeXlItems.push(safex);
+    }
 
-    const invDoc = await Invoice.create({
-      number: await nextNumber(),
-      date: date || new Date(),
+    const invDate = date || new Date();
+    let numberToUse;
+    if (clientNumber !== undefined && Number.isInteger(Number(clientNumber)) && Number(clientNumber) >= 1) {
+      // ensure unique globally
+      const exists = await Invoice.findOne({ number: Number(clientNumber) }).lean();
+      if (!exists) numberToUse = Number(clientNumber);
+    }
+    if (numberToUse === undefined) numberToUse = await nextNumber(invDate);
+
+    // Build invoice server-side and compute totals (do NOT trust client totals)
+    const invObj = new Invoice({
+      number: numberToUse,
+      date: invDate,
+      dueDate: dueDate || undefined,
       type,
       customer: customerId || null,
       items: safeItems,
       xlItems: safeXlItems,
-      totalWithout: Number(totalWithout || 0),
-      totalWith: Number(totalWith || 0),
-      xlTotal: Number(xlTotal || 0),
-      grandTotal,
-    })
+    });
 
-    const out = await Invoice.findById(invDoc._id).populate("customer").populate("items.product").populate("xlItems.product")
+    // compute totals using model method
+    invObj.recalculateTotals();
 
-    // Create PurchaseItems for purchase invoices (these represent incoming stock rows)
+    // persist
+    const invDoc = await invObj.save();
+
+    // return populated invoice
+    const out = await Invoice.findById(invDoc._id).populate("customer").populate("items.product").populate("xlItems.product");
+
+    // --- create PurchaseItems for purchases but DO NOT touch inventory here ---
     try {
       if (out.type === "purchase") {
-        const invoiceNumber = out.number || String(out._id)
-        const invDate = out.date || out.createdAt
+        const invoiceNumber = out.number || String(out._id);
+        const invDateLocal = out.date || out.createdAt;
 
-        // fetch existing purchaseitems (on create should be none, but handle gracefully)
-        const existing = await PurchaseItem.find({ invoiceNumber }).lean()
-        const existingBySubId = new Map(existing.map((e) => [String(e.invoiceItemId || ""), e]))
+        const existing = await PurchaseItem.find({ invoiceNumber }).lean();
+        const existingBySubId = new Map(existing.map((e) => [String(e.invoiceItemId || ""), e]));
 
-        // normal items -> create up to two subrows (without / with)
         for (const it of out.items || []) {
-          const parentId = String(it.invoiceItemId || makeInvoiceItemId())
+          const parentId = String(it.invoiceItemId || makeInvoiceItemId());
 
-          // WITHOUT symbol
-          const withoutQty = computeQuantityFromInvoiceLine(
-            {
-              piece: Number(it.pieceWithout || 0),
-              weight: Number(it.weightWithout || 0),
-              rateType: it.rateTypeWithout || "piece",
-              quantity: Number(it.quantityWithout || 0),
-            },
-            false
-          )
+          // WITHOUT
+          const withoutQty = computeQuantityFromInvoiceLine({
+            piece: Number(it.pieceWithout || 0),
+            weight: Number(it.weightWithout || 0),
+            rateType: it.rateTypeWithout || "piece",
+            quantity: Number(it.quantityWithout || 0),
+          }, false);
           if (withoutQty > 0) {
-            const subInvoiceId = subId(parentId, "without")
-            const existingPI = existingBySubId.get(subInvoiceId)
-            const piPayload = buildPurchaseItemPayload({
+            const subInvoiceId = subId(parentId, "without");
+            const existingPI = existingBySubId.get(subInvoiceId);
+            const piPayload = {
               invoiceNumber,
-              invDate,
+              invoiceDate: invDateLocal,
               invoiceItemId: subInvoiceId,
               invoiceParentItemId: parentId,
               product: it.product || undefined,
               productName: it.productName || undefined,
               productSku: it.productSku || undefined,
-              piece: it.rateTypeWithout === "weight" ? 0 : Number(it.pieceWithout || 0),
-              weight: it.rateTypeWithout === "weight" ? Number(it.weightWithout || 0) : 0,
+              piece: Number(it.pieceWithout || 0),
+              weight: Number(it.weightWithout || 0),
               quantity: withoutQty,
               description: it.description || "",
               hasSymbol: false,
               isXL: false,
               status: existingPI ? existingPI.status : "pending",
-            })
-            if (existingPI) {
-              await PurchaseItem.findByIdAndUpdate(existingPI._id, { $set: piPayload })
-            } else {
-              await PurchaseItem.create(piPayload)
-            }
+              inventoryAppliedAt: existingPI ? existingPI.inventoryAppliedAt : undefined,
+            };
+            if (existingPI) await PurchaseItem.findByIdAndUpdate(existingPI._id, { $set: piPayload });
+            else await PurchaseItem.create(piPayload);
           }
 
-          // WITH symbol
-          const withQty = computeQuantityFromInvoiceLine(
-            {
-              piece: Number(it.pieceWith || 0),
-              weight: Number(it.weightWith || 0),
-              rateType: it.rateTypeWith || "piece",
-              quantity: Number(it.quantityWith || 0),
-            },
-            false
-          )
+          // WITH
+          const withQty = computeQuantityFromInvoiceLine({
+            piece: Number(it.pieceWith || 0),
+            weight: Number(it.weightWith || 0),
+            rateType: it.rateTypeWith || "piece",
+            quantity: Number(it.quantityWith || 0),
+          }, false);
           if (withQty > 0) {
-            const subInvoiceId = subId(parentId, "with")
-            const existingPI = existingBySubId.get(subInvoiceId)
-            const piPayload = buildPurchaseItemPayload({
+            const subInvoiceId = subId(parentId, "with");
+            const existingPI = existingBySubId.get(subInvoiceId);
+            const piPayload = {
               invoiceNumber,
-              invDate,
+              invoiceDate: invDateLocal,
               invoiceItemId: subInvoiceId,
               invoiceParentItemId: parentId,
               product: it.product || undefined,
               productName: it.productName || undefined,
               productSku: it.productSku || undefined,
-              piece: it.rateTypeWith === "weight" ? 0 : Number(it.pieceWith || 0),
-              weight: it.rateTypeWith === "weight" ? Number(it.weightWith || 0) : 0,
+              piece: Number(it.pieceWith || 0),
+              weight: Number(it.weightWith || 0),
               quantity: withQty,
               description: it.description || "",
               hasSymbol: true,
               isXL: false,
               status: existingPI ? existingPI.status : "pending",
-            })
-            if (existingPI) {
-              await PurchaseItem.findByIdAndUpdate(existingPI._id, { $set: piPayload })
-            } else {
-              await PurchaseItem.create(piPayload)
-            }
+              inventoryAppliedAt: existingPI ? existingPI.inventoryAppliedAt : undefined,
+            };
+            if (existingPI) await PurchaseItem.findByIdAndUpdate(existingPI._id, { $set: piPayload });
+            else await PurchaseItem.create(piPayload);
           }
         }
 
-        // XL items -> single subrow per XL item
+        // XL items
         for (const x of out.xlItems || []) {
-          const parentId = String(x.invoiceItemId || makeInvoiceItemId())
-          const unitQty = computeQuantityFromInvoiceLine(
-            {
-              piece: Number(x.piece || 0),
-              weight: Number(x.weight || 0),
-              rateType: x.rateType || "weight",
-              quantity: Number(x.quantity || 0),
-            },
-            true
-          )
-          if (unitQty <= 0) continue
-          const subInvoiceId = subId(parentId, "xl")
-          const existingPI = existingBySubId.get(subInvoiceId)
-          const piPayload = buildPurchaseItemPayload({
+          const parentId = String(x.invoiceItemId || makeInvoiceItemId());
+          const unitQty = computeQuantityFromInvoiceLine({
+            piece: Number(x.piece || 0),
+            weight: Number(x.weight || 0),
+            rateType: x.rateType || "weight",
+            quantity: Number(x.quantity || 0),
+          }, true);
+          if (unitQty <= 0) continue;
+          const subInvoiceId = subId(parentId, "xl");
+          const existingPI = existingBySubId.get(subInvoiceId);
+          const piPayload = {
             invoiceNumber,
-            invDate,
+            invoiceDate: invDateLocal,
             invoiceItemId: subInvoiceId,
             invoiceParentItemId: parentId,
             product: x.product || undefined,
             productName: x.productName || undefined,
             productSku: x.productSku || undefined,
-            piece: x.rateType === "weight" ? 0 : Number(x.piece || 0),
-            weight: x.rateType === "weight" ? Number(x.weight || 0) : 0,
+            piece: Number(x.piece || 0),
+            weight: Number(x.weight || 0),
             quantity: unitQty,
             rate: Number(x.rate || 0),
             description: x.description || "",
             hasSymbol: !!x.productSku,
             isXL: true,
             status: existingPI ? existingPI.status : "pending",
-          })
-          if (existingPI) {
-            await PurchaseItem.findByIdAndUpdate(existingPI._id, { $set: piPayload })
-          } else {
-            await PurchaseItem.create(piPayload)
-          }
+            inventoryAppliedAt: existingPI ? existingPI.inventoryAppliedAt : undefined,
+          };
+          if (existingPI) await PurchaseItem.findByIdAndUpdate(existingPI._id, { $set: piPayload });
+          else await PurchaseItem.create(piPayload);
+        }
+
+        // IMPORTANT: do NOT reset statuses for existing PurchaseItems here (preserve 'produced' / 'no_production')
+      } else {
+        // Non-purchase invoices: legacy behavior — mark pending PIs as no_production
+        try {
+          await PurchaseItem.updateMany({ invoiceNumber: out.number, status: "pending" }, { status: "no_production" });
+        } catch (e) {
+          console.warn("[invoices][post-create] mark no_production failed for non-purchase invoice", e && e.message ? e.message : e);
         }
       }
     } catch (err) {
-      console.error("[PurchaseItems] create after invoice error:", err)
+      console.error("[PurchaseItems] create after invoice error:", err);
     }
 
-    // Inventory adjustments: only apply automatically for SALES invoices (decrement immediately)
+    // Inventory adjustments only for SALES (create)
     try {
       if (out.type === "sale") {
-        const qtys = quantitiesFromItems(out.items || [], out.xlItems || [])
-        const deltas = {}
-        for (const [pid, q] of Object.entries(qtys)) deltas[pid] = -1 * q // sale decreases stock
-        await applyInventoryDeltas(deltas)
+        const qtys = quantitiesFromItems(out.items || [], out.xlItems || []);
+        const deltas = {};
+        for (const [compositeKey, q] of Object.entries(qtys)) deltas[compositeKey] = -1 * q;
+        await applyInventoryDeltas(deltas);
       }
-      // For 'purchase' invoices we DO NOT apply inventory here — inventory will be increased
-      // when PurchaseItem moves to status 'produced' or 'no_production' via production endpoints.
     } catch (err) {
-      console.error("[Inventory adjust after create] error:", err)
+      console.error("[Inventory adjust after create] error:", err);
     }
 
-    res.json(out)
+    res.json(out);
   } catch (err) {
-    console.error("[Invoice Create Error]", err)
-    res.status(500).json({ message: "Server Error: " + err.message })
+    console.error("[Invoice Create Error]", err);
+    res.status(500).json({ message: "Server Error: " + err.message });
   }
-})
+});
 
-/** PUT /:id - update invoice and smart sync purchase items (split by with/without) */
+/** UPDATE invoice */
 router.put("/:id", async (req, res) => {
   try {
-    const { number, date, type, customerId, items = [], xlItems = [], totalWithout, totalWith, xlTotal } = req.body
-    const grandTotal = Number(totalWithout || 0) + Number(totalWith || 0) + Number(xlTotal || 0)
+    // include dueDate from client
+    const { number, date, dueDate, type, customerId, items = [], xlItems = [] } = req.body;
 
-    const safeItems = (items || []).map((i) => ({
-      invoiceItemId: i.invoiceItemId || makeInvoiceItemId(),
-      product: i.productId || i.product,
-      productName: i.productName || undefined,
-      productSku: i.productSku || undefined,
-      pieceWithout: Number(i.pieceWithout || 0),
-      weightWithout: Number(i.weightWithout || 0),
-      rateWithout: Number(i.rateWithout || 0),
-      rateTypeWithout: i.rateTypeWithout || "piece",
-      pieceWith: Number(i.pieceWith || 0),
-      weightWith: Number(i.weightWith || 0),
-      rateWith: Number(i.rateWith || 0),
-      rateTypeWith: i.rateTypeWith || "piece",
-      quantityWithout: Number(i.quantityWithout || 0),
-      quantityWith: Number(i.quantityWith || 0),
-      itemDate: i.itemDate,
-      description: i.description || "",
-    }))
+    // Build safeItems async
+    const safeItems = [];
+    for (const i of (items || [])) {
+      const safe = await buildSafeInvoiceItem(i);
+      safeItems.push(safe);
+    }
 
-    const safeXlItems = (xlItems || []).map((x) => ({
-      invoiceItemId: x.invoiceItemId || makeInvoiceItemId(),
-      product: x.productId || x.product,
-      productName: x.productName || undefined,
-      productSku: x.productSku || undefined,
-      piece: Number(x.piece || 0),
-      weight: Number(x.weight || 0),
-      rateType: x.rateType || "weight",
-      rate: Number(x.rate || 0),
-      quantity: Number(x.quantity || 0),
-      itemDate: x.itemDate,
-      description: x.description || "",
-    }))
+    const safeXlItems = [];
+    for (const x of (xlItems || [])) {
+      const safex = await buildSafeXlItem(x);
+      safeXlItems.push(safex);
+    }
 
-    // load old invoice for inventory diff
-    const oldInv = await Invoice.findById(req.params.id).lean()
+    // Load old (lean) invoice for inventory diffing & reference
+    const oldInv = await Invoice.findById(req.params.id).lean();
 
-    const inv = await Invoice.findByIdAndUpdate(
-      req.params.id,
-      {
-        number: Number(number || 0),
-        date: date || new Date(),
-        type,
-        customer: customerId || null,
-        items: safeItems,
-        xlItems: safeXlItems,
-        totalWithout: Number(totalWithout || 0),
-        totalWith: Number(totalWith || 0),
-        xlTotal: Number(xlTotal || 0),
-        grandTotal,
-      },
-      { new: true }
-    ).populate("customer").populate("items.product").populate("xlItems.product")
+    // If client provided a new number, ensure it's unique (global)
+    if (number !== undefined && Number.isInteger(Number(number)) && Number(number) >= 1) {
+      const existingNum = await Invoice.findOne({ number: Number(number), _id: { $ne: req.params.id } }).lean();
+      if (existingNum) {
+        return res.status(400).json({ message: "Invoice number already in use" });
+      }
+    }
 
-    // Smart PurchaseItem sync — only if invoice is a 'purchase'
+    // Load invoice document
+    const invDoc = await Invoice.findById(req.params.id);
+    if (!invDoc) return res.status(404).json({ message: "Invoice not found" });
+
+    // Update fields (server authoritative)
+    if (number !== undefined) invDoc.number = Number(number || 0);
+    invDoc.date = date || invDoc.date || new Date();
+    // persist dueDate when provided (allow clearing by sending empty string/null)
+    invDoc.dueDate = dueDate !== undefined ? (dueDate || undefined) : invDoc.dueDate;
+    invDoc.type = type;
+    invDoc.customer = customerId || null;
+
+    // Replace items / xlItems with safe arrays
+    invDoc.items = safeItems;
+    invDoc.xlItems = safeXlItems;
+
+    // Recalculate totals server-side
+    invDoc.recalculateTotals();
+
+    // Save
+    const saved = await invDoc.save();
+
+    // Populate before further processing
+    const inv = await Invoice.findById(saved._id).populate("customer").populate("items.product").populate("xlItems.product");
+
     try {
       if (inv.type === "purchase") {
-        const invoiceNumber = inv.number || String(inv._id)
-        const invDate = inv.date || inv.createdAt || new Date()
-        const existing = await PurchaseItem.find({ invoiceNumber }).lean()
-        const existingBySubId = new Map(existing.map((e) => [String(e.invoiceItemId || ""), e]))
-        const desiredSubIds = new Set()
+        const invoiceNumber = inv.number || String(inv._id);
+        const invDateLocal = inv.date || inv.createdAt || new Date();
+        // Fetch existing PIs for this invoice (before update state)
+        const existing = await PurchaseItem.find({ invoiceNumber }).lean();
+        const existingBySubId = new Map(existing.map((e) => [String(e.invoiceItemId || ""), e]));
+        const desiredSubIds = new Set();
 
-        // for each invoice item -> maybe create/update 2 subrows
+        // For each item in invoice, create/update or delete matching PurchaseItems.
         for (const it of inv.items || []) {
-          const parentId = String(it.invoiceItemId || makeInvoiceItemId())
+          const parentId = String(it.invoiceItemId || makeInvoiceItemId());
 
-          // WITHOUT symbol
-          const withoutQty = computeQuantityFromInvoiceLine(
-            {
-              piece: Number(it.pieceWithout || 0),
-              weight: Number(it.weightWithout || 0),
-              rateType: it.rateTypeWithout || "piece",
-              quantity: Number(it.quantityWithout || 0),
-            },
-            false
-          )
-          const withoutSubId = subId(parentId, "without")
-          desiredSubIds.add(withoutSubId)
+          // WITHOUT
+          const withoutQty = computeQuantityFromInvoiceLine({
+            piece: Number(it.pieceWithout || 0),
+            weight: Number(it.weightWithout || 0),
+            rateType: it.rateTypeWithout || "piece",
+            quantity: Number(it.quantityWithout || 0),
+          }, false);
+          const withoutSubId = subId(parentId, "without");
+          desiredSubIds.add(withoutSubId);
           if (withoutQty > 0) {
-            const existingPI = existingBySubId.get(withoutSubId)
-            const piPayload = buildPurchaseItemPayload({
+            const existingPI = existingBySubId.get(withoutSubId);
+            const piPayload = {
               invoiceNumber,
-              invDate,
+              invoiceDate: invDateLocal,
               invoiceItemId: withoutSubId,
               invoiceParentItemId: parentId,
               product: it.product || undefined,
               productName: it.productName || undefined,
               productSku: it.productSku || undefined,
-              piece: it.rateTypeWithout === "weight" ? 0 : Number(it.pieceWithout || 0),
-              weight: it.rateTypeWithout === "weight" ? Number(it.weightWithout || 0) : 0,
+              piece: Number(it.pieceWithout || 0),
+              weight: Number(it.weightWithout || 0),
               quantity: withoutQty,
               description: it.description || "",
               hasSymbol: false,
               isXL: false,
               status: existingPI ? existingPI.status : "pending",
-            })
+              inventoryAppliedAt: existingPI ? existingPI.inventoryAppliedAt : undefined,
+            };
             if (existingPI) {
-              if (existingPI.status === "pending" || existingPI.status === "no_production") {
-                await PurchaseItem.findByIdAndUpdate(existingPI._id, { $set: piPayload })
-              } else {
-                await PurchaseItem.findByIdAndUpdate(existingPI._id, { $set: { ...piPayload, status: existingPI.status } })
-              }
+              await PurchaseItem.findByIdAndUpdate(existingPI._id, { $set: piPayload });
             } else {
-              await PurchaseItem.create(piPayload)
+              await PurchaseItem.create(piPayload);
             }
           } else {
-            // zero qty -> delete pending existing subrow
-            const ex = existingBySubId.get(withoutSubId)
-            if (ex && ex.status === "pending") {
-              await PurchaseItem.deleteOne({ _id: ex._id })
-            }
+            // removed from invoice: delete only if pending (safe)
+            const ex = existingBySubId.get(withoutSubId);
+            if (ex && ex.status === "pending") await PurchaseItem.deleteOne({ _id: ex._id });
           }
 
-          // WITH symbol
-          const withQty = computeQuantityFromInvoiceLine(
-            {
-              piece: Number(it.pieceWith || 0),
-              weight: Number(it.weightWith || 0),
-              rateType: it.rateTypeWith || "piece",
-              quantity: Number(it.quantityWith || 0),
-            },
-            false
-          )
-          const withSubId = subId(parentId, "with")
-          desiredSubIds.add(withSubId)
+          // WITH
+          const withQty = computeQuantityFromInvoiceLine({
+            piece: Number(it.pieceWith || 0),
+            weight: Number(it.weightWith || 0),
+            rateType: it.rateTypeWith || "piece",
+            quantity: Number(it.quantityWith || 0),
+          }, false);
+          const withSubId = subId(parentId, "with");
+          desiredSubIds.add(withSubId);
           if (withQty > 0) {
-            const existingPI = existingBySubId.get(withSubId)
-            const piPayload = buildPurchaseItemPayload({
+            const existingPI = existingBySubId.get(withSubId);
+            const piPayload = {
               invoiceNumber,
-              invDate,
+              invoiceDate: invDateLocal,
               invoiceItemId: withSubId,
               invoiceParentItemId: parentId,
               product: it.product || undefined,
               productName: it.productName || undefined,
               productSku: it.productSku || undefined,
-              piece: it.rateTypeWith === "weight" ? 0 : Number(it.pieceWith || 0),
-              weight: it.rateTypeWith === "weight" ? Number(it.weightWith || 0) : 0,
+              piece: Number(it.pieceWith || 0),
+              weight: Number(it.weightWith || 0),
               quantity: withQty,
               description: it.description || "",
               hasSymbol: true,
               isXL: false,
               status: existingPI ? existingPI.status : "pending",
-            })
+              inventoryAppliedAt: existingPI ? existingPI.inventoryAppliedAt : undefined,
+            };
             if (existingPI) {
-              if (existingPI.status === "pending" || existingPI.status === "no_production") {
-                await PurchaseItem.findByIdAndUpdate(existingPI._id, { $set: piPayload })
-              } else {
-                await PurchaseItem.findByIdAndUpdate(existingPI._id, { $set: { ...piPayload, status: existingPI.status } })
-              }
+              await PurchaseItem.findByIdAndUpdate(existingPI._id, { $set: piPayload });
             } else {
-              await PurchaseItem.create(piPayload)
+              await PurchaseItem.create(piPayload);
             }
           } else {
-            const ex = existingBySubId.get(withSubId)
-            if (ex && ex.status === "pending") {
-              await PurchaseItem.deleteOne({ _id: ex._id })
-            }
+            const ex = existingBySubId.get(withSubId);
+            if (ex && ex.status === "pending") await PurchaseItem.deleteOne({ _id: ex._id });
           }
         }
 
-        // XL items (single sub-row)
+        // XL items
         for (const x of inv.xlItems || []) {
-          const parentId = String(x.invoiceItemId || makeInvoiceItemId())
-          const xlSubId = subId(parentId, "xl")
-          desiredSubIds.add(xlSubId)
-          const unitQty = computeQuantityFromInvoiceLine(
-            {
-              piece: Number(x.piece || 0),
-              weight: Number(x.weight || 0),
-              rateType: x.rateType || "weight",
-              quantity: Number(x.quantity || 0),
-            },
-            true
-          )
+          const parentId = String(x.invoiceItemId || makeInvoiceItemId());
+          const xlSubId = subId(parentId, "xl");
+          desiredSubIds.add(xlSubId);
+          const unitQty = computeQuantityFromInvoiceLine({
+            piece: Number(x.piece || 0),
+            weight: Number(x.weight || 0),
+            rateType: x.rateType || "weight",
+            quantity: Number(x.quantity || 0),
+          }, true);
           if (unitQty > 0) {
-            const existingPI = existingBySubId.get(xlSubId)
-            const piPayload = buildPurchaseItemPayload({
+            const existingPI = existingBySubId.get(xlSubId);
+            const piPayload = {
               invoiceNumber,
-              invDate,
+              invoiceDate: invDateLocal,
               invoiceItemId: xlSubId,
               invoiceParentItemId: parentId,
               product: x.product || undefined,
               productName: x.productName || undefined,
               productSku: x.productSku || undefined,
-              piece: x.rateType === "weight" ? 0 : Number(x.piece || 0),
-              weight: x.rateType === "weight" ? Number(x.weight || 0) : 0,
+              piece: Number(x.piece || 0),
+              weight: Number(x.weight || 0),
               quantity: unitQty,
               rate: Number(x.rate || 0),
               description: x.description || "",
               hasSymbol: !!x.productSku,
               isXL: true,
               status: existingPI ? existingPI.status : "pending",
-            })
+              inventoryAppliedAt: existingPI ? existingPI.inventoryAppliedAt : undefined,
+            };
             if (existingPI) {
-              if (existingPI.status === "pending" || existingPI.status === "no_production") {
-                await PurchaseItem.findByIdAndUpdate(existingPI._id, { $set: piPayload })
-              } else {
-                await PurchaseItem.findByIdAndUpdate(existingPI._id, { $set: { ...piPayload, status: existingPI.status } })
-              }
+              await PurchaseItem.findByIdAndUpdate(existingPI._id, { $set: piPayload });
             } else {
-              await PurchaseItem.create(piPayload)
+              await PurchaseItem.create(piPayload);
             }
           } else {
-            const ex = existingBySubId.get(xlSubId)
-            if (ex && ex.status === "pending") {
-              await PurchaseItem.deleteOne({ _id: ex._id })
-            }
+            const ex = existingBySubId.get(xlSubId);
+            if (ex && ex.status === "pending") await PurchaseItem.deleteOne({ _id: ex._id });
           }
         }
 
-        // remove stale pending purchase items that no longer exist in invoice lines
+        // cleanup stale existing rows (only delete pending)
         for (const ex of existing) {
-          const sid = String(ex.invoiceItemId || "")
+          const sid = String(ex.invoiceItemId || "");
           if (!sid || !desiredSubIds.has(sid)) {
             if (ex.status === "pending") {
-              await PurchaseItem.deleteOne({ _id: ex._id })
+              await PurchaseItem.deleteOne({ _id: ex._id });
             } else {
-              // keep produced/in_production rows but mark them safe as no_production
-              await PurchaseItem.findByIdAndUpdate(ex._id, { status: "no_production" })
+              // keep produced/no_production rows as-is; we do not change them
             }
           }
         }
+
+        // IMPORTANT: Do not reset statuses here. Preserve 'produced' and 'no_production' values so items already finalized won't be reopened.
       } else {
-        // If updated invoice is NOT 'purchase', mark any pending PurchaseItems for this invoice as no_production
         try {
-          await PurchaseItem.updateMany({ invoiceNumber: inv.number, status: "pending" }, { status: "no_production" })
-          // NOTE: we do not adjust inventory here — marking no_production should be a deliberate action via production endpoints
+          await PurchaseItem.updateMany({ invoiceNumber: inv.number, status: "pending" }, { status: "no_production" });
         } catch (err) {
-          console.warn("[PurchaseItems] mark no_production failed for non-purchase invoice:", inv.number, err)
+          console.warn("[PurchaseItems] mark no_production failed for non-purchase invoice:", inv.number, err);
         }
       }
     } catch (err) {
-      console.error("[PurchaseItems] sync after update error:", err)
+      console.error("[PurchaseItems] sync after update error:", err);
     }
 
-    // Inventory adjustments (calculate diff only for SALES)
+    // Inventory adjustments only for SALES
     try {
-      // inventory only auto-updated for sales invoices (decrement/increment for sale updates)
-      const oldQtys = oldInv ? quantitiesFromItems(oldInv.items || [], oldInv.xlItems || []) : {}
-      const newQtys = quantitiesFromItems(inv.items || [], inv.xlItems || [])
+      const oldQtys = oldInv ? quantitiesFromItems(oldInv.items || [], oldInv.xlItems || []) : {};
+      const newQtys = quantitiesFromItems(inv.items || [], inv.xlItems || []);
       function signedMap(qtys, invType) {
-        const sign = invType === "sale" ? -1 : 0 // NOTE: for purchase we don't apply here
-        const m = {}
-        for (const [pid, q] of Object.entries(qtys || {})) m[pid] = sign * q
-        return m
+        const sign = invType === "sale" ? -1 : 0;
+        const m = {};
+        for (const [k, q] of Object.entries(qtys || {})) m[k] = sign * q;
+        return m;
       }
-      const oldEffect = oldInv ? signedMap(oldQtys, oldInv.type) : {}
-      const newEffect = signedMap(newQtys, inv.type)
-      const diff = {}
-      const pids = new Set([...Object.keys(oldEffect || {}), ...Object.keys(newEffect || {})])
-      for (const pid of pids) {
-        const n = Number(newEffect[pid] || 0)
-        const o = Number(oldEffect[pid] || 0)
-        const d = n - o
-        if (d !== 0) diff[pid] = d
+      const oldEffect = oldInv ? signedMap(oldQtys, oldInv.type) : {};
+      const newEffect = signedMap(newQtys, inv.type);
+      const diff = {};
+      const keys = new Set([...Object.keys(oldEffect || {}), ...Object.keys(newEffect || {})]);
+      for (const k of keys) {
+        const n = Number(newEffect[k] || 0);
+        const o = Number(oldEffect[k] || 0);
+        const d = n - o;
+        if (d !== 0) diff[k] = d;
       }
-      // Only apply non-empty diffs (will be only for sales)
-      if (Object.keys(diff).length) await applyInventoryDeltas(diff)
+      if (Object.keys(diff).length) await applyInventoryDeltas(diff);
     } catch (err) {
-      console.error("[Inventory adjust after update] error:", err)
+      console.error("[Inventory adjust after update] error:", err);
     }
 
-    res.json(inv)
+    res.json(inv);
   } catch (err) {
-    console.error("[Invoice Update Error]", err)
-    res.status(500).json({ message: "Server Error: " + err.message })
+    console.error("[Invoice Update Error]", err);
+    res.status(500).json({ message: "Server Error: " + err.message });
   }
-})
+});
 
-/** DELETE /:id - reverse invoice effect and delete
- * For SALES we reverse inventory effect. For PURCHASE we remove PurchaseItems but do NOT modify inventory here.
- */
+/** DELETE /:id */
 router.delete("/:id", async (req, res) => {
   try {
-    const inv = await Invoice.findById(req.params.id).lean()
+    const inv = await Invoice.findById(req.params.id).lean();
 
     if (inv) {
       try {
-        // reverse only sales inventory effect
         if (inv.type === "sale") {
-          const qtys = quantitiesFromItems(inv.items || [], inv.xlItems || [])
-          const deltas = {}
-          for (const [pid, q] of Object.entries(qtys)) {
-            deltas[pid] = +q // reversing a sale => add back stock
-          }
-          await applyInventoryDeltas(deltas)
+          const qtys = quantitiesFromItems(inv.items || [], inv.xlItems || []);
+          const deltas = {};
+          for (const [k, q] of Object.entries(qtys)) deltas[k] = +q; // reversing sale => add back
+          await applyInventoryDeltas(deltas);
         }
       } catch (err) {
-        console.error("[Inventory adjust before delete] error:", err)
+        console.error("[Inventory adjust before delete] error:", err);
       }
     }
 
     try {
-      const invoiceNumber = inv?.number || String(req.params.id)
+      const invoiceNumber = inv?.number || String(req.params.id);
       if (inv?.type === "purchase") {
-        // delete PurchaseItems for purchase invoices (incoming rows) — inventory unaffected here
-        await PurchaseItem.deleteMany({ invoiceNumber })
+        // Delete only pending purchase items — keep produced ones untouched
+        await PurchaseItem.deleteMany({ invoiceNumber, status: "pending" });
       } else {
-        // for non-purchase invoices, mark pending PurchaseItems as no_production (safety)
-        await PurchaseItem.updateMany({ invoiceNumber, status: "pending" }, { status: "no_production" })
+        await PurchaseItem.updateMany({ invoiceNumber, status: "pending" }, { status: "no_production" });
       }
     } catch (err) {
-      console.error("[PurchaseItems] remove before delete error:", err)
+      console.error("[PurchaseItems] remove before delete error:", err);
     }
 
-    await Invoice.findByIdAndDelete(req.params.id)
-    res.json({ success: true })
+    await Invoice.findByIdAndDelete(req.params.id);
+    res.json({ success: true });
   } catch (err) {
-    console.error("[Invoice Delete Error]", err)
-    res.status(500).json({ message: "Server Error: " + err.message })
+    console.error("[Invoice Delete Error]", err);
+    res.status(500).json({ message: "Server Error: " + err.message });
   }
-})
+});
 
-export default router
+export default router;

@@ -1,13 +1,10 @@
 // models/Invoice.js
-import mongoose from "mongoose"
+import mongoose from "mongoose";
 
 const invoiceItemSchema = new mongoose.Schema(
   {
-    // stable identifier used to sync PurchaseItems
     invoiceItemId: { type: String, index: true },
-
     product: { type: mongoose.Schema.Types.ObjectId, ref: "Product", required: false },
-    // friendly fallback fields — important for production grouping & display
     productName: { type: String },
     productSku: { type: String },
 
@@ -24,15 +21,14 @@ const invoiceItemSchema = new mongoose.Schema(
     itemDate: Date,
     description: String,
   },
-  { _id: false },
-)
+  { _id: false }
+);
 
 const xlItemSchema = new mongoose.Schema(
   {
     invoiceItemId: { type: String, index: true },
 
     product: { type: mongoose.Schema.Types.ObjectId, ref: "Product" },
-    // friendly fallback fields for XL items too
     productName: { type: String },
     productSku: { type: String },
 
@@ -43,23 +39,60 @@ const xlItemSchema = new mongoose.Schema(
     itemDate: Date,
     description: String,
   },
-  { _id: false },
-)
+  { _id: false }
+);
 
 const invoiceSchema = new mongoose.Schema(
   {
-    number: Number,
+    number: { type: Number, index: true },
     type: { type: String, enum: ["sale", "purchase"], required: true },
     date: { type: Date, default: Date.now },
+    dueDate: { type: Date },
     customer: { type: mongoose.Schema.Types.ObjectId, ref: "Customer" },
+
     items: [invoiceItemSchema],
     xlItems: [xlItemSchema],
+
+    // Totals
     totalWithout: { type: Number, default: 0 },
     totalWith: { type: Number, default: 0 },
     xlTotal: { type: Number, default: 0 },
     grandTotal: { type: Number, default: 0 },
   },
-  { timestamps: true },
-)
+  { timestamps: true }
+);
 
-export const Invoice = mongoose.model("Invoice", invoiceSchema)
+// Corrected recalculateTotals: computes totalWithout, totalWith, xlTotal and grandTotal
+invoiceSchema.methods.recalculateTotals = function () {
+  const items = this.items || [];
+  const xl = this.xlItems || [];
+
+  let totalWithout = 0;
+  let totalWith = 0;
+
+  for (const it of items) {
+    const rowWithout = (it.rateTypeWithout === "weight")
+      ? (Number(it.weightWithout || 0) * Number(it.rateWithout || 0))
+      : (Number(it.pieceWithout || 0) * Number(it.rateWithout || 0));
+    const rowWith = (it.rateTypeWith === "weight")
+      ? (Number(it.weightWith || 0) * Number(it.rateWith || 0))
+      : (Number(it.pieceWith || 0) * Number(it.rateWith || 0));
+    totalWithout += rowWithout;
+    totalWith += rowWith;
+  }
+
+  const xlTotal = (xl || []).reduce((s, x) => {
+    const xVal = (x.rateType === "weight")
+      ? (Number(x.weight || 0) * Number(x.rate || 0))
+      : (Number(x.piece || 0) * Number(x.rate || 0));
+    return s + xVal;
+  }, 0);
+
+  this.totalWithout = Number(totalWithout || 0);
+  this.totalWith = Number(totalWith || 0);
+  this.xlTotal = Number(xlTotal || 0);
+  this.grandTotal = Number(this.totalWithout || 0) + Number(this.totalWith || 0) + Number(this.xlTotal || 0);
+};
+
+export const Invoice = mongoose.model("Invoice", invoiceSchema);
+export default Invoice;

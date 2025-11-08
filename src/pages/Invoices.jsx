@@ -1,8 +1,22 @@
+// Invoices.jsx
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../lib/api";
+
+/**
+ * Invoices.jsx
+ *
+ * - Preserves invoiceItemId for full edits so backend can match PurchaseItem rows
+ * - Adds buildProductionItems() helper to create explicit production rows
+ * - After saving a full edit, front-end will NOT attempt inventory endpoints (inventory must be handled server-side).
+ * - Adds editable rate-type selects for Without/With and XL items in Full Edit.
+ * - Adds Due Date edit in Full Edit and prints it.
+ * - Adds Summary panel to Full Edit (mirrors NewInvoice calculation).
+ *
+ * Keep frontend inventory calls removed — backend must apply inventory changes atomically.
+ */
 
 export default function Invoices() {
   const [invoices, setInvoices] = useState([]);
@@ -16,6 +30,103 @@ export default function Invoices() {
   const [fullEditId, setFullEditId] = useState(null);
   const [fullEditData, setFullEditData] = useState(null);
 
+  /* ----------------- Helpers ----------------- */
+
+  function makeLocalId() {
+    try {
+      return crypto.randomUUID();
+    } catch {
+      return String(Math.random()).slice(2);
+    }
+  }
+
+  function computeQuantityFromInvoiceLine(line = {}, isXL = false) {
+    if (!line) return 0;
+    const explicit = Number(line.quantity || 0);
+    if (explicit > 0) return explicit;
+    const piece = Number(line.piece || 0);
+    const weight = Number(line.weight || 0);
+    const rtype = line.rateType || "piece";
+    if (rtype === "weight") return weight > 0 ? weight : 0;
+    return piece > 0 ? piece : 0;
+  }
+
+  function buildProductionItemsFromFullEdit(data) {
+    if (!data) return [];
+    const prodRows = [];
+
+    const items = data.items || [];
+    const xl = data.xlItems || [];
+
+    for (const it of items) {
+      // Without symbol
+      const withoutPiece = Number(it.pieceWithout || 0);
+      const withoutWeight = Number(it.weightWithout || 0);
+      if (withoutPiece > 0 || withoutWeight > 0) {
+        prodRows.push({
+          invoiceNumber: Number(data.number || 0),
+          invoiceDate: data.date || undefined,
+          productId: it.productId || undefined,
+          productName: it.productName || undefined,
+          productSku: it.productSku || undefined,
+          piece: withoutPiece,
+          weight: withoutWeight,
+          quantity: withoutPiece > 0 ? withoutPiece : withoutWeight,
+          rate: Number(it.rateWithout || 0),
+          rateType: it.rateTypeWithout || "piece",
+          hasSymbol: false,
+          description: it.description || "",
+        });
+      }
+
+      // With symbol
+      const withPiece = Number(it.pieceWith || 0);
+      const withWeight = Number(it.weightWith || 0);
+      if (withPiece > 0 || withWeight > 0) {
+        prodRows.push({
+          invoiceNumber: Number(data.number || 0),
+          invoiceDate: data.date || undefined,
+          productId: it.productId || undefined,
+          productName: it.productName || undefined,
+          productSku: it.productSku || undefined,
+          piece: withPiece,
+          weight: withWeight,
+          quantity: withPiece > 0 ? withPiece : withWeight,
+          rate: Number(it.rateWith || 0),
+          rateType: it.rateTypeWith || "piece",
+          hasSymbol: true,
+          description: it.description || "",
+        });
+      }
+    }
+
+    // XL items
+    for (const x of xl) {
+      const piece = Number(x.piece || 0);
+      const weight = Number(x.weight || 0);
+      if (piece > 0 || weight > 0) {
+        prodRows.push({
+          invoiceNumber: Number(data.number || 0),
+          invoiceDate: data.date || undefined,
+          productId: x.productId || undefined,
+          productName: x.productName || undefined,
+          productSku: x.productSku || undefined,
+          piece,
+          weight,
+          quantity: piece > 0 ? piece : weight,
+          rate: Number(x.rate || 0),
+          rateType: x.rateType || "weight",
+          hasSymbol: false,
+          description: x.description || `XL - ${x.productName || ""}`,
+        });
+      }
+    }
+
+    return prodRows;
+  }
+
+  /* ----------------- Full Edit Open ----------------- */
+
   async function openFullEdit(inv) {
     setFullEditId(inv._id);
 
@@ -23,11 +134,13 @@ export default function Invoices() {
     setFullEditData({
       number: inv.number,
       date: inv.date?.slice(0, 10) || new Date().toISOString().slice(0, 10),
+      // dueDate may be undefined; convert to yyyy-mm-dd or empty string
+      dueDate: inv.dueDate ? new Date(inv.dueDate).toISOString().slice(0, 10) : "",
       type: inv.type,
       customerId: inv.customer?._id || inv.customerId || "",
       items: (inv.items || []).map((it) => ({
         // local UI id for array rendering (not the server invoiceItemId)
-        id: crypto.randomUUID(),
+        id: makeLocalId(),
         // crucial: preserve invoiceItemId if it exists (server uses it to match PurchaseItems)
         invoiceItemId: it.invoiceItemId || undefined,
         productId: it.product?._id || it.productId || "",
@@ -39,31 +152,28 @@ export default function Invoices() {
         weightWith: it.weightWith || 0,
         rateWith: it.rateWith || 0,
         rateTypeWith: it.rateTypeWith || "piece",
-        itemDate: it.itemDate
-          ? it.itemDate.slice(0, 10)
-          : inv.date.slice(0, 10),
+        itemDate: it.itemDate ? it.itemDate.slice(0, 10) : (inv.date ? inv.date.slice(0,10) : new Date().toISOString().slice(0,10)),
         description: it.description || "",
         productName: it.productName || it.product?.name || "",
         productSku: it.productSku || it.product?.sku || "",
       })),
-      xlItems:
-        (inv.xlItems || []).map((x) => ({
-          id: crypto.randomUUID(),
-          invoiceItemId: x.invoiceItemId || undefined,
-          productId: x.product?._id || x.productId || "",
-          piece: x.piece || 0,
-          weight: x.weight || 0,
-          rate: x.rate || 0,
-          rateType: x.rateType || "weight",
-          itemDate: x.itemDate
-            ? x.itemDate.slice(0, 10)
-            : inv.date.slice(0, 10),
-          description: x.description || "",
-          productName: x.productName || x.product?.name || "",
-          productSku: x.productSku || x.product?.sku || "",
-        })) || [],
+      xlItems: (inv.xlItems || []).map((x) => ({
+        id: makeLocalId(),
+        invoiceItemId: x.invoiceItemId || undefined,
+        productId: x.product?._id || x.productId || "",
+        piece: x.piece || 0,
+        weight: x.weight || 0,
+        rate: x.rate || 0,
+        rateType: x.rateType || "weight",
+        itemDate: x.itemDate ? x.itemDate.slice(0, 10) : (inv.date ? inv.date.slice(0,10) : new Date().toISOString().slice(0,10)),
+        description: x.description || "",
+        productName: x.productName || x.product?.name || "",
+        productSku: x.productSku || x.product?.sku || "",
+      })) || [],
     });
   }
+
+  /* ----------------- Save Full Edit ----------------- */
 
   async function saveFullEdit(id) {
     try {
@@ -77,6 +187,7 @@ export default function Invoices() {
       const payload = {
         number: fullEditData.number,
         date: fullEditData.date,
+        dueDate: fullEditData.dueDate || undefined,
         type: fullEditData.type,
         customerId: fullEditData.customerId,
         items: (fullEditData.items || []).map((it) => ({
@@ -103,7 +214,7 @@ export default function Invoices() {
           piece: x.piece,
           weight: x.weight,
           rate: x.rate,
-          rateType: x.rateType || "piece",
+          rateType: x.rateType || "weight",
           itemDate: x.itemDate,
           description: x.description || "",
           productName: x.productName || undefined,
@@ -111,9 +222,13 @@ export default function Invoices() {
         })),
       };
 
+      // PUT (update) invoice on server
       await api.put(`/invoices/${id}`, payload);
+
+      // Clear edit UI and reload list
       setFullEditId(null);
-      load();
+      setFullEditData(null);
+      await load();
     } catch (err) {
       console.error("[v0] Save full edit error:", err);
       alert("Error saving invoice: " + (err.message || err));
@@ -122,54 +237,65 @@ export default function Invoices() {
 
   function cancelFullEdit() {
     setFullEditId(null);
+    setFullEditData(null);
   }
 
   function updateFullEditItem(idx, patch) {
-    setFullEditData((prev) => ({
-      ...prev,
-      items: prev.items.map((it, i) => (i === idx ? { ...it, ...patch } : it)),
-    }));
+    setFullEditData((prev) =>
+      prev
+        ? {
+            ...prev,
+            items: prev.items.map((it, i) => (i === idx ? { ...it, ...patch } : it)),
+          }
+        : prev
+    );
   }
 
   function addFullEditItem() {
     // new items should NOT have invoiceItemId so server knows they're new
-    const newLocalId = crypto.randomUUID();
-    setFullEditData((prev) => ({
-      ...prev,
-      items: [
-        ...prev.items,
-        {
-          id: newLocalId,
-          invoiceItemId: undefined,
-          productId: "",
-          pieceWithout: 0,
-          weightWithout: 0,
-          rateWithout: 0,
-          rateTypeWithout: "piece",
-          pieceWith: 0,
-          weightWith: 0,
-          rateWith: 0,
-          rateTypeWith: "piece",
-          itemDate: prev.date,
-          description: "",
-          productName: "",
-          productSku: "",
-        },
-      ],
-    }));
+    const newLocalId = makeLocalId();
+    setFullEditData((prev) =>
+      prev
+        ? {
+            ...prev,
+            items: [
+              ...prev.items,
+              {
+                id: newLocalId,
+                invoiceItemId: undefined,
+                productId: "",
+                pieceWithout: 0,
+                weightWithout: 0,
+                rateWithout: 0,
+                rateTypeWithout: "piece",
+                pieceWith: 0,
+                weightWith: 0,
+                rateWith: 0,
+                rateTypeWith: "piece",
+                itemDate: prev.date,
+                description: "",
+                productName: "",
+                productSku: "",
+              },
+            ],
+          }
+        : prev
+    );
   }
 
   function removeFullEditItem(idx) {
-    setFullEditData((prev) => ({
-      ...prev,
-      items: prev.items.filter((_, i) => i !== idx),
-    }));
+    setFullEditData((prev) =>
+      prev ? { ...prev, items: prev.items.filter((_, i) => i !== idx) } : prev
+    );
   }
+
+  /* ----------------- Load & basic actions ----------------- */
 
   async function load() {
     const rows = await api.get("/invoices");
     setInvoices(rows || []);
   }
+
   useEffect(() => {
     load();
   }, []);
@@ -178,9 +304,7 @@ export default function Invoices() {
     const q = query.toLowerCase().trim();
     if (!q) return invoices;
     return invoices.filter((inv) => {
-      const hay = `${inv.number} ${inv.type} ${inv.customer?.name || ""} ${
-        inv.customer?.firmName || ""
-      }`.toLowerCase();
+      const hay = `${inv.number} ${inv.type} ${inv.customer?.name || ""} ${inv.customer?.firmName || ""}`.toLowerCase();
       return hay.includes(q);
     });
   }, [query, invoices]);
@@ -225,6 +349,8 @@ export default function Invoices() {
     setEditingId(null);
   }
 
+  /* ----------------- Print ----------------- */
+
   function printInvoice(inv) {
     let profile = null;
     try {
@@ -232,11 +358,6 @@ export default function Invoices() {
       if (raw) profile = JSON.parse(raw);
     } catch {}
 
-    const sellerName = profile?.firmName || "Your Company";
-    const sellerAddr = profile?.address || "";
-    const sellerPhone = profile?.phone || "";
-    const sellerEmail = profile?.email || "";
-    const sellerGstin = profile?.gstin || "";
     const logoImg = profile?.logo || "";
 
     const cust = inv.customer || {};
@@ -277,9 +398,7 @@ export default function Invoices() {
 
     const itemsHtml = (inv.items || [])
       .map((it, idx) => {
-        const itemDate = it.itemDate
-          ? new Date(it.itemDate).toLocaleDateString()
-          : new Date(inv.date).toLocaleDateString();
+        const itemDate = it.itemDate ? new Date(it.itemDate).toLocaleDateString() : new Date(inv.date).toLocaleDateString();
         const totalWithoutRow =
           it.rateTypeWithout === "weight"
             ? Number(it.rateWithout || 0) * Number(it.weightWithout || 0)
@@ -295,25 +414,13 @@ export default function Invoices() {
           <td>${idx + 1}</td>
           <td>${itemDate}</td>
           <td>${name}</td>
-          <td style="text-align:right">${Number(it.pieceWithout || 0).toFixed(
-            2
-          )}</td>
-          <td style="text-align:right">${Number(it.weightWithout || 0).toFixed(
-            2
-          )}</td>
-          <td style="text-align:right">${Number(it.rateWithout || 0).toFixed(
-            2
-          )}</td>
+          <td style="text-align:right">${Number(it.pieceWithout || 0).toFixed(2)}</td>
+          <td style="text-align:right">${Number(it.weightWithout || 0).toFixed(2)}</td>
+          <td style="text-align:right">${Number(it.rateWithout || 0).toFixed(2)}</td>
           <td style="text-align:right">${totalWithoutRow.toFixed(2)}</td>
-          <td style="text-align:right">${Number(it.pieceWith || 0).toFixed(
-            2
-          )}</td>
-          <td style="text-align:right">${Number(it.weightWith || 0).toFixed(
-            2
-          )}</td>
-          <td style="text-align:right">${Number(it.rateWith || 0).toFixed(
-            2
-          )}</td>
+          <td style="text-align:right">${Number(it.pieceWith || 0).toFixed(2)}</td>
+          <td style="text-align:right">${Number(it.weightWith || 0).toFixed(2)}</td>
+          <td style="text-align:right">${Number(it.rateWith || 0).toFixed(2)}</td>
           <td style="text-align:right">${totalWithRow.toFixed(2)}</td>
         </tr>`;
       })
@@ -321,15 +428,8 @@ export default function Invoices() {
 
     const xlItemsHtml = (inv.xlItems || [])
       .map((x, idx) => {
-        const itemDate = x.itemDate
-          ? new Date(x.itemDate).toLocaleDateString()
-          : new Date(inv.date).toLocaleDateString();
-        const totalXl =
-          x.rateType === "weight"
-            ? Number(x.rate || 0) * Number(x.weight || 0)
-            : Number(x.rate || 0) * Number(x.piece || 0);
-
-        // Label XL items using productName fallback
+        const itemDate = x.itemDate ? new Date(x.itemDate).toLocaleDateString() : new Date(inv.date).toLocaleDateString();
+        const totalXl = x.rateType === "weight" ? Number(x.rate || 0) * Number(x.weight || 0) : Number(x.rate || 0) * Number(x.piece || 0);
         const xlLabel = `XL - ${x.productName || (x.product && x.product.name) || ""}`;
 
         return `<tr style="background-color: #fef3c7">
@@ -348,8 +448,7 @@ export default function Invoices() {
       })
       .join("");
 
-    const termsAndConditions =
-      profile?.termsAndConditions || "Thank You For Your Business!";
+    const termsAndConditions = profile?.termsAndConditions || "Thank You For Your Business!";
 
     const win = window.open("", "PRINT", "width=1200,height=1100");
     win.document.write(`
@@ -391,6 +490,7 @@ export default function Invoices() {
             <div class="box" style="width: 320px">
               <div><strong>Invoice #</strong> ${inv.number}</div>
               <div><strong>Date</strong> ${new Date(inv.date).toLocaleDateString()}</div>
+              <div><strong>Due</strong> ${inv.dueDate ? new Date(inv.dueDate).toLocaleDateString() : "-"}</div>
               <div><strong>Type</strong> ${inv.type}</div>
             </div>
           </div>
@@ -441,22 +541,65 @@ export default function Invoices() {
     win.close();
   }
 
+  /* ----------------- Customers & Products ----------------- */
+
   const [customers, setCustomers] = useState([]);
   const [products, setProducts] = useState([]);
 
   useEffect(() => {
     async function getCustomers() {
       const data = await api.get("/customers");
-      setCustomers(data);
+      setCustomers(data || []);
     }
     async function getProducts() {
       const data = await api.get("/products");
-      setProducts(data);
+      setProducts(data || []);
     }
 
     getCustomers();
     getProducts();
   }, []);
+
+  /* ----------------- Full Edit Summary ----------------- */
+
+  const fullEditSummary = useMemo(() => {
+    if (!fullEditData) return { itemsCount: 0, xlCount: 0, totalWithout: 0, totalWith: 0, xlTotal: 0, grandTotal: 0 };
+    const items = fullEditData.items || [];
+    const xl = fullEditData.xlItems || [];
+
+    let totalWithout = 0;
+    let totalWith = 0;
+    for (const it of items) {
+      const rowWithout = (it.rateTypeWithout === "weight")
+        ? (Number(it.weightWithout || 0) * Number(it.rateWithout || 0))
+        : (Number(it.pieceWithout || 0) * Number(it.rateWithout || 0));
+      const rowWith = (it.rateTypeWith === "weight")
+        ? (Number(it.weightWith || 0) * Number(it.rateWith || 0))
+        : (Number(it.pieceWith || 0) * Number(it.rateWith || 0));
+      totalWithout += rowWithout;
+      totalWith += rowWith;
+    }
+
+    const xlTotal = (xl || []).reduce((s, x) => {
+      const xVal = (x.rateType === "weight")
+        ? (Number(x.weight || 0) * Number(x.rate || 0))
+        : (Number(x.piece || 0) * Number(x.rate || 0));
+      return s + xVal;
+    }, 0);
+
+    const grandTotal = Number(totalWithout || 0) + Number(totalWith || 0) + Number(xlTotal || 0);
+
+    return {
+      itemsCount: items.length,
+      xlCount: xl.length,
+      totalWithout,
+      totalWith,
+      xlTotal,
+      grandTotal,
+    };
+  }, [fullEditData]);
+
+  /* ----------------- Render ----------------- */
 
   return (
     <div className="grid" aria-labelledby="invoices-heading">
@@ -509,6 +652,17 @@ export default function Invoices() {
                   value={fullEditData?.date || ""}
                   onChange={(e) =>
                     setFullEditData({ ...fullEditData, date: e.target.value })
+                  }
+                />
+              </div>
+              <div>
+                <label className="block text-sm mb-1">Due Date</label>
+                <input
+                  className="w-full border rounded px-3 py-2"
+                  type="date"
+                  value={fullEditData?.dueDate || ""}
+                  onChange={(e) =>
+                    setFullEditData({ ...fullEditData, dueDate: e.target.value })
                   }
                 />
               </div>
@@ -575,30 +729,36 @@ export default function Invoices() {
                       >
                         <option value="">Select</option>
                         {products?.map((p) => (
+                          // FIXED: value should be p._id (previously p._1 typo)
                           <option key={p._id} value={p._id}>
                             {p.name}
                           </option>
                         ))}
                       </select>
                     </div>
+                    <div>
+                      <label className="block text-sm mb-1">Description</label>
+                      <input
+                        className="w-full border rounded px-3 py-2"
+                        value={it.description || ""}
+                        onChange={(e) => updateFullEditItem(idx, { description: e.target.value })}
+                      />
+                    </div>
                   </div>
 
-                  <div
-                    style={{
-                      paddingTop: "0.5rem",
-                      borderTop: "1px solid #e5e7eb",
-                    }}
-                  >
-                    <h4
-                      style={{
-                        margin: "0.5rem 0",
-                        fontSize: "0.875rem",
-                        color: "#475569",
-                      }}
-                    >
+                  <div style={{ paddingTop: "0.5rem", borderTop: "1px solid #e5e7eb" }}>
+                    <h4 style={{ margin: "0.5rem 0", fontSize: "0.875rem", color: "#475569" }}>
                       Without Symbol
                     </h4>
-                    <div className="grid grid-3 gap-2">
+                    <div className="grid grid-4 gap-2">
+                      <div>
+                        <label className="block text-sm mb-1">Rate Depends On</label>
+                        <select className="w-full border rounded px-3 py-2" value={it.rateTypeWithout || "piece"}
+                          onChange={(e) => updateFullEditItem(idx, { rateTypeWithout: e.target.value })}>
+                          <option value="piece">Per Piece</option>
+                          <option value="weight">Per Weight</option>
+                        </select>
+                      </div>
                       <div>
                         <label className="block text-sm mb-1">Piece</label>
                         <input
@@ -645,16 +805,18 @@ export default function Invoices() {
                   </div>
 
                   <div style={{ paddingTop: "0.5rem" }}>
-                    <h4
-                      style={{
-                        margin: "0.5rem 0",
-                        fontSize: "0.875rem",
-                        color: "#475569",
-                      }}
-                    >
+                    <h4 style={{ margin: "0.5rem 0", fontSize: "0.875rem", color: "#475569" }}>
                       With Symbol
                     </h4>
-                    <div className="grid grid-3 gap-2">
+                    <div className="grid grid-4 gap-2">
+                      <div>
+                        <label className="block text-sm mb-1">Rate Depends On</label>
+                        <select className="w-full border rounded px-3 py-2" value={it.rateTypeWith || "piece"}
+                          onChange={(e) => updateFullEditItem(idx, { rateTypeWith: e.target.value })}>
+                          <option value="piece">Per Piece</option>
+                          <option value="weight">Per Weight</option>
+                        </select>
+                      </div>
                       <div>
                         <label className="block text-sm mb-1">Piece</label>
                         <input
@@ -763,9 +925,40 @@ export default function Invoices() {
                         ))}
                       </select>
                     </div>
+                    <div>
+                      <label className="block text-sm mb-1">Description</label>
+                      <input
+                        className="w-full border rounded px-3 py-2"
+                        value={x.description || ""}
+                        onChange={(e) =>
+                          setFullEditData((prev) => ({
+                            ...prev,
+                            xlItems: prev.xlItems.map((it, i) =>
+                              i === idx ? { ...it, description: e.target.value } : it
+                            ),
+                          }))
+                        }
+                      />
+                    </div>
                   </div>
 
-                  <div className="grid grid-3 gap-2 mt-2">
+                  <div className="grid grid-4 gap-2 mt-2">
+                    <div>
+                      <label className="block text-sm mb-1">Rate Depends On</label>
+                      <select className="w-full border rounded px-3 py-2" value={x.rateType || "weight"}
+                        onChange={(e) =>
+                          setFullEditData((prev) => ({
+                            ...prev,
+                            xlItems: prev.xlItems.map((it, i) =>
+                              i === idx ? { ...it, rateType: e.target.value } : it
+                            ),
+                          }))
+                        }
+                      >
+                        <option value="piece">Per Piece</option>
+                        <option value="weight">Per Weight</option>
+                      </select>
+                    </div>
                     <div>
                       <label className="block text-sm mb-1">Piece</label>
                       <input
@@ -777,9 +970,7 @@ export default function Invoices() {
                           setFullEditData((prev) => ({
                             ...prev,
                             xlItems: prev.xlItems.map((it, i) =>
-                              i === idx
-                                ? { ...it, piece: Number(e.target.value) }
-                                : it
+                              i === idx ? { ...it, piece: Number(e.target.value) } : it
                             ),
                           }))
                         }
@@ -796,9 +987,7 @@ export default function Invoices() {
                           setFullEditData((prev) => ({
                             ...prev,
                             xlItems: prev.xlItems.map((it, i) =>
-                              i === idx
-                                ? { ...it, weight: Number(e.target.value) }
-                                : it
+                              i === idx ? { ...it, weight: Number(e.target.value) } : it
                             ),
                           }))
                         }
@@ -815,9 +1004,7 @@ export default function Invoices() {
                           setFullEditData((prev) => ({
                             ...prev,
                             xlItems: prev.xlItems.map((it, i) =>
-                              i === idx
-                                ? { ...it, rate: Number(e.target.value) }
-                                : it
+                              i === idx ? { ...it, rate: Number(e.target.value) } : it
                             ),
                           }))
                         }
@@ -846,14 +1033,14 @@ export default function Invoices() {
                     xlItems: [
                       ...(prev.xlItems || []),
                       {
-                        id: crypto.randomUUID(),
+                        id: makeLocalId(),
                         invoiceItemId: undefined,
                         productId: "",
                         piece: 0,
                         weight: 0,
                         rate: 0,
-                        rateType: "piece",
-                        itemDate: fullEditData.date,
+                        rateType: "weight",
+                        itemDate: prev.date,
                         description: "",
                         productName: "",
                         productSku: "",
@@ -864,6 +1051,37 @@ export default function Invoices() {
               >
                 + Add XL Item
               </button>
+            </div>
+
+            {/* SUMMARY panel (like NewInvoice) */}
+            <div className="card p-3" style={{ border: "1px solid #e5e7eb" }}>
+              <h3 style={{ marginTop: 0 }}>Summary</h3>
+              <div className="grid grid-3">
+                <div>
+                  <div className="subtle">Items</div>
+                  <div style={{ fontWeight: 700 }}>{fullEditSummary.itemsCount}</div>
+                </div>
+                <div>
+                  <div className="subtle">XL Items</div>
+                  <div style={{ fontWeight: 700 }}>{fullEditSummary.xlCount}</div>
+                </div>
+                <div>
+                  <div className="subtle">Total (Without)</div>
+                  <div style={{ fontWeight: 700 }}>{Number(fullEditSummary.totalWithout || 0).toFixed(2)}</div>
+                </div>
+                <div>
+                  <div className="subtle">Total (With)</div>
+                  <div style={{ fontWeight: 700 }}>{Number(fullEditSummary.totalWith || 0).toFixed(2)}</div>
+                </div>
+                <div>
+                  <div className="subtle">Total (XL)</div>
+                  <div style={{ fontWeight: 700 }}>{Number(fullEditSummary.xlTotal || 0).toFixed(2)}</div>
+                </div>
+                <div>
+                  <div className="subtle">Grand Total</div>
+                  <div style={{ fontWeight: 900, fontSize: "1.1rem" }}>{Number(fullEditSummary.grandTotal || 0).toFixed(2)}</div>
+                </div>
+              </div>
             </div>
 
             <div className="flex gap-2">

@@ -1,52 +1,142 @@
+// routes/reports.js
 import { Router } from "express";
-import { Invoice } from "../models/Invoice.js"; // adjust path if needed
+import { Invoice } from "../models/Invoice.js";
 
 const router = Router();
 
-// ✅ GET /api/reports?from=YYYY-MM-DD&to=YYYY-MM-DD&type=sales|purchase|both
+/**
+ * GET /api/reports?from=YYYY-MM-DD&to=YYYY-MM-DD&type=sales|purchase|both&customerId=<optional>
+ *
+ * - If customerId is provided: returns detailed per-product lines for every invoice (items & xlItems).
+ * - Otherwise: returns invoice-level rows (legacy behaviour).
+ */
 router.get("/", async (req, res) => {
   try {
-    const { from, to, type } = req.query;
+    const { from, to, type, customerId } = req.query;
     if (!from || !to) {
       return res.status(400).json({ message: "Missing date range" });
     }
 
     const start = new Date(from);
+    start.setHours(0, 0, 0, 0);
     const end = new Date(to);
     end.setHours(23, 59, 59, 999);
 
-    const filter = { createdAt: { $gte: start, $lte: end } };
+    const filter = { date: { $gte: start, $lte: end } };
     if (type && type !== "both") {
       filter.type = type === "sales" ? "sale" : "purchase";
+    }
+    if (customerId) {
+      // support whether client passed object id or plain string
+      filter.customer = customerId;
     }
 
     const invoices = await Invoice.find(filter)
       .populate("customer")
-      .sort({ date: -1 });
+      .populate("items.product")
+      .populate("xlItems.product")
+      .sort({ date: -1 })
+      .lean();
 
-    const data = invoices.map((r) => ({
-      date: r.date,
-      type: r.type === "sale" ? "Sales" : "Purchase",
-      number: r.number,
-      customer: r.customer?.firmName || r.customer?.name || "-",
-      totalWithout: r.items.reduce(
-        (s, it) =>
-          s +
-          (it.rateTypeWithout === "weight"
-            ? Number(it.weightWithout || 0) * Number(it.rateWithout || 0)
-            : Number(it.pieceWithout || 0) * Number(it.rateWithout || 0)),
-        0
-      ),
-      totalWith: r.items.reduce(
-        (s, it) =>
-          s +
-          (it.rateTypeWith === "weight"
-            ? Number(it.weightWith || 0) * Number(it.rateWith || 0)
-            : Number(it.pieceWith || 0) * Number(it.rateWith || 0)),
-        0
-      ),
-      total: r.total || 0,
-    }));
+    // If customerId provided -> return detailed per-product rows
+    if (customerId) {
+      const rows = [];
+      for (const inv of invoices) {
+        const base = {
+          invoiceId: inv._id,
+          date: inv.date,
+          type: inv.type === "sale" ? "Sales" : "Purchase",
+          number: inv.number,
+          customer: inv.customer?.firmName || inv.customer?.name || "-",
+        };
+
+        // items -> combine without/with into a single row per invoice item
+        for (const it of inv.items || []) {
+          const pieceWithout = Number(it.pieceWithout || 0);
+          const weightWithout = Number(it.weightWithout || 0);
+          const rateWithout = Number(it.rateWithout || 0);
+          const pieceWith = Number(it.pieceWith || 0);
+          const weightWith = Number(it.weightWith || 0);
+          const rateWith = Number(it.rateWith || 0);
+
+          const totalWithout = it.rateTypeWithout === "weight"
+            ? weightWithout * rateWithout
+            : pieceWithout * rateWithout;
+          const totalWith = it.rateTypeWith === "weight"
+            ? weightWith * rateWith
+            : pieceWith * rateWith;
+
+          const productLabel = it.productName || (it.product && it.product.name) || it.productSku || "Item";
+
+          rows.push({
+            ...base,
+            product: productLabel,
+            // without fields
+            pieceWithout,
+            weightWithout,
+            rateWithout,
+            // with fields
+            pieceWith,
+            weightWith,
+            rateWith,
+            // xl fields unused for normal items
+            xlPiece: 0,
+            xlWeight: 0,
+            xlRate: 0,
+            total: Number(totalWithout || 0) + Number(totalWith || 0),
+          });
+        }
+
+        // XL items -> separate rows (XL-specific)
+        for (const x of inv.xlItems || []) {
+          const piece = Number(x.piece || 0);
+          const weight = Number(x.weight || 0);
+          const rate = Number(x.rate || 0);
+          const totalXl = x.rateType === "weight" ? weight * rate : piece * rate;
+          const productLabel = x.productName || (x.product && x.product.name) || x.productSku || "XL Item";
+
+          rows.push({
+            ...base,
+            product: `XL - ${productLabel}`,
+            // without fields empty
+            pieceWithout: 0,
+            weightWithout: 0,
+            rateWithout: 0,
+            // with fields empty
+            pieceWith: 0,
+            weightWith: 0,
+            rateWith: 0,
+            // xl fields filled
+            xlPiece: piece,
+            xlWeight: weight,
+            xlRate: rate,
+            total: Number(totalXl || 0),
+          });
+        }
+      }
+
+      return res.json(rows);
+    }
+
+    // Legacy: invoice-level rows (when no customerId filter is applied)
+    const data = invoices.map((r) => {
+      const totalWithout = Number(r.totalWithout || 0);
+      const totalWith = Number(r.totalWith || 0);
+      const xlTotal = Number(r.xlTotal || 0);
+      const grand = Number(r.grandTotal ?? (totalWithout + totalWith + xlTotal));
+
+      return {
+        date: r.date,
+        type: r.type === "sale" ? "Sales" : "Purchase",
+        number: r.number,
+        customer: r.customer?.firmName || r.customer?.name || "-",
+        totalWithout,
+        totalWith,
+        xlTotal,
+        grandTotal: grand,
+        total: r.total || 0,
+      };
+    });
 
     res.json(data);
   } catch (err) {

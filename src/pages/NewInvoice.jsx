@@ -1,13 +1,20 @@
+// NewInvoice.jsx
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../lib/api";
 import {
-  nextInvoiceNumberForType,
   recordInvoiceNumber,
   getFinancialYear,
 } from "../lib/billing";
+
+/**
+ * NewInvoice.jsx
+ *
+ * IMPORTANT: This version DOES NOT call inventory endpoints after creating a purchase invoice.
+ * Inventory must be applied later when a purchase item is finalized.
+ */
 
 export default function NewInvoice() {
   const navigate = useNavigate();
@@ -19,6 +26,9 @@ export default function NewInvoice() {
   const [itemDates, setItemDates] = useState({});
   const [saving, setSaving] = useState(false);
   const [invoiceDate, setInvoiceDate] = useState(() =>
+    new Date().toISOString().slice(0, 10)
+  );
+  const [dueDate, setDueDate] = useState(() =>
     new Date().toISOString().slice(0, 10)
   );
   const [invoiceNumber, setInvoiceNumber] = useState(0);
@@ -35,7 +45,7 @@ export default function NewInvoice() {
       const cid = cs?.[0]?._id || "";
       setCustomerId(cid);
 
-      // init with one item and prefill name & sku from first product if exists
+      // init with one item and prefill name & sku
       const first = ps?.[0] || null;
       const id0 = crypto.randomUUID();
       setItems([
@@ -56,19 +66,33 @@ export default function NewInvoice() {
       ]);
       setItemDates({ [id0]: invoiceDate });
 
-      const num = nextInvoiceNumberForType(type === "sale" ? "sales" : "purchase", new Date(invoiceDate));
-      setInvoiceNumber(num);
+      // fetch next number from server (global mixed sequence)
+      try {
+        const resp = await api.get(`/invoices/next-number?date=${encodeURIComponent(invoiceDate)}`);
+        setInvoiceNumber(resp?.nextNumber || 1);
+      } catch (e) {
+        console.warn("Failed to fetch next invoice number from server", e);
+        setInvoiceNumber(1);
+      }
+
+      setDueDate(invoiceDate);
     }
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    const num = nextInvoiceNumberForType(type === "sale" ? "sales" : "purchase", new Date(invoiceDate));
-    setInvoiceNumber(num);
-  }, [type, invoiceDate]);
+    async function refreshNum() {
+      try {
+        const resp = await api.get(`/invoices/next-number?date=${encodeURIComponent(invoiceDate)}`);
+        setInvoiceNumber(resp?.nextNumber || 1);
+      } catch (e) {
+        console.warn("Failed to fetch next invoice number from server", e);
+      }
+    }
+    refreshNum();
+  }, [invoiceDate]);
 
-  // updateItem: when productId changes, also set productName & productSku
   function updateItem(id, patch) {
     setItems((prev) =>
       prev.map((it) => {
@@ -196,7 +220,6 @@ export default function NewInvoice() {
       maximumFractionDigits: 2,
     });
 
-  // Helper to detect if a normal item has any quantity (with or without symbol)
   function itemHasQuantity(d) {
     return (
       Number(d.pieceWithout || 0) > 0 ||
@@ -206,14 +229,10 @@ export default function NewInvoice() {
     );
   }
 
-  // Build per-production normalized rows (helps backend create PurchaseItems without guesswork)
   function buildProductionItems(filteredItems, filteredXl) {
     const prodRows = [];
 
-    // For normal items, create two separate production rows when both exist:
-    // one for without symbol (hasSymbol: false), one for with symbol (hasSymbol: true).
     for (const it of filteredItems) {
-      // Without symbol
       const withoutPiece = Number(it.pieceWithout || 0);
       const withoutWeight = Number(it.weightWithout || 0);
       if (withoutPiece > 0 || withoutWeight > 0) {
@@ -223,7 +242,7 @@ export default function NewInvoice() {
           productId: it.productId || undefined,
           productName: it.name || it.productName || undefined,
           productSku: it.sku || it.productSku || undefined,
-          piece: withoutPiece, // zero if weight-only
+          piece: withoutPiece,
           weight: withoutWeight,
           quantity: withoutPiece > 0 ? withoutPiece : withoutWeight,
           rate: Number(it.rateWithout || 0),
@@ -233,7 +252,6 @@ export default function NewInvoice() {
         });
       }
 
-      // With symbol
       const withPiece = Number(it.pieceWith || 0);
       const withWeight = Number(it.weightWith || 0);
       if (withPiece > 0 || withWeight > 0) {
@@ -254,7 +272,6 @@ export default function NewInvoice() {
       }
     }
 
-    // XL items - label description as XL - ProductName
     for (const x of filteredXl) {
       const piece = Number(x.piece || 0);
       const weight = Number(x.weight || 0);
@@ -271,7 +288,6 @@ export default function NewInvoice() {
           rate: Number(x.rate || 0),
           rateType: x.rateType || "weight",
           hasSymbol: false,
-          // XL label so production UI shows "XL - Product name"
           description: `XL - ${x.name || x.productName || ""}`,
         });
       }
@@ -284,19 +300,18 @@ export default function NewInvoice() {
     e.preventDefault();
     setSaving(true);
     try {
-      // Filter out lines that have zero quantity to avoid creating empty PurchaseItems
       const filteredItems = calc.detailed.filter(itemHasQuantity);
       const filteredXl = calcXl.detailedXl.filter((x) => Number(x.piece || 0) > 0 || Number(x.weight || 0) > 0);
 
-      // Build productionRows to explicitly describe what should go to production.
+      // Build productionItems for backend context if needed (will be ignored here)
       const productionItems = buildProductionItems(filteredItems, filteredXl);
 
       const payload = {
         number: Number(invoiceNumber),
         date: invoiceDate,
+        dueDate,
         type,
         customerId: customerId || null,
-        // Keep the invoice schema as before (items/xlItems) so server invoice storage remains unchanged
         items: filteredItems.map((d) => ({
           productId: d.productId || undefined,
           productName: d.name || undefined,
@@ -324,25 +339,20 @@ export default function NewInvoice() {
           description: x.description || "",
         })),
         totalWithout: Number(calc.total),
-        totalWith: calcXl.totalXl ? Number(calcXl.total) : 0,
+        totalWith: 0,
         xlTotal: Number(calcXl.totalXl || 0),
-
-        // NEW: explicit production rows that backend can use to create PurchaseItem entries.
-        // This prevents guesswork and duplicates on the server.
-        productionItems,
+        productionItems, // backend can use this field if wanted
       };
 
+      // Save invoice first (server should handle PI creation and NOT apply inventory for purchases).
       const inv = await api.post("/invoices", payload);
-      if (inv) {
-        // tell billing numbers module we used this number
-        recordInvoiceNumber(
-          type === "sale" ? "sales" : "purchase",
-          invoiceNumber,
-          new Date(invoiceDate)
-        );
-        alert("Invoice saved successfully!");
-        navigate("/invoices");
-      }
+      if (!inv) throw new Error("Failed to create invoice");
+
+      // Persist invoice number usage in your local billing helper (client-side bookkeeping)
+      recordInvoiceNumber(type === "sale" ? "sales" : "purchase", invoiceNumber, new Date(invoiceDate));
+
+      alert("Invoice saved successfully!");
+      navigate("/invoices");
     } catch (err) {
       console.error("[v0] Save invoice error:", err);
       alert("Error saving invoice: " + (err?.message || err));
@@ -380,11 +390,13 @@ export default function NewInvoice() {
           <div className="badge">Bill No: {invoiceNumber}</div>
           <div className="row" style={{ gap: 8 }}>
             <label className="subtle">Date</label>
-            <input type="date" className="border rounded px-3 py-2" value={invoiceDate} onChange={(e) => setInvoiceDate(e.target.value)} />
+            <input type="date" className="border rounded px-3 py-2" value={invoiceDate} onChange={(e) => { setInvoiceDate(e.target.value); if (!dueDate) setDueDate(e.target.value); }} />
+            <label className="subtle">Due date</label>
+            <input type="date" className="border rounded px-3 py-2" value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
           </div>
         </div>
         <p className="subtle" style={{ marginTop: "0.25rem" }}>
-          Bill number starts at 0 and resets every 1st April (financial year).
+          Bill number starts at 1 and resets every 1st April (financial year).
         </p>
       </div>
 
@@ -547,7 +559,8 @@ export default function NewInvoice() {
               <div className="grid" style={{ gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: "0.5rem", marginBottom: "1rem" }}>
                 <div className="form-row">
                   <label>Rate Depends On</label>
-                  <select value={x.rateType || "weight"} onChange={(e) => setXlItems((prev) => prev.map((it) => (it.id === x.id ? { ...it, rateType: e.target.value } : it)))}>
+                  <select value={x.rateType || "weight"} onChange={(e) => setXlItems((prev) => prev.map((it) => (it.id === x.id ? { ...it, rateType: e.target.value } : it)))}
+                >
                     <option value="piece">Per Piece</option>
                     <option value="weight">Per Weight</option>
                   </select>

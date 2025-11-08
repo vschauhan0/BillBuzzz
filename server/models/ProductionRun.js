@@ -1,13 +1,13 @@
 // models/ProductionRun.js
-import mongoose from "mongoose"
+import mongoose from "mongoose";
 
 const productionStepSchema = new mongoose.Schema(
   {
     name: String,
     completedAt: Date,
   },
-  { _id: false },
-)
+  { _id: false }
+);
 
 const productionRunSchema = new mongoose.Schema(
   {
@@ -21,8 +21,11 @@ const productionRunSchema = new mongoose.Schema(
     completedAt: Date,
     // optional link to purchase item
     purchaseItem: { type: mongoose.Schema.Types.ObjectId, ref: "PurchaseItem", required: false },
-  },
-  { timestamps: true },
-)
 
-export const ProductionRun = mongoose.model("ProductionRun", productionRunSchema)
+    // startedAt is sometimes useful to show when run started
+    startedAt: { type: Date, default: Date.now },
+  },
+  { timestamps: true }
+);
+
+export const ProductionRun = mongoose.model("ProductionRun", productionRunSchema);
