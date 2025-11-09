@@ -8,6 +8,8 @@ const router = Router();
  * GET /api/reports?from=YYYY-MM-DD&to=YYYY-MM-DD&type=sales|purchase|both&customerId=<optional>
  *
  * - If customerId is provided: returns detailed per-product lines for every invoice (items & xlItems).
+ *   Each product row uses the product's own date (itemDate) if present, otherwise falls back to invoice date.
+ *   Detailed rows are sorted by product date (ascending).
  * - Otherwise: returns invoice-level rows (legacy behaviour).
  */
 router.get("/", async (req, res) => {
@@ -27,7 +29,7 @@ router.get("/", async (req, res) => {
       filter.type = type === "sales" ? "sale" : "purchase";
     }
     if (customerId) {
-      // support whether client passed object id or plain string
+      // allow passing either id or string
       filter.customer = customerId;
     }
 
@@ -44,13 +46,12 @@ router.get("/", async (req, res) => {
       for (const inv of invoices) {
         const base = {
           invoiceId: inv._id,
-          date: inv.date,
           type: inv.type === "sale" ? "Sales" : "Purchase",
           number: inv.number,
           customer: inv.customer?.firmName || inv.customer?.name || "-",
         };
 
-        // items -> combine without/with into a single row per invoice item
+        // items -> one row per invoice item (combine without/with quantities in same row)
         for (const it of inv.items || []) {
           const pieceWithout = Number(it.pieceWithout || 0);
           const weightWithout = Number(it.weightWithout || 0);
@@ -59,17 +60,27 @@ router.get("/", async (req, res) => {
           const weightWith = Number(it.weightWith || 0);
           const rateWith = Number(it.rateWith || 0);
 
-          const totalWithout = it.rateTypeWithout === "weight"
-            ? weightWithout * rateWithout
-            : pieceWithout * rateWithout;
-          const totalWith = it.rateTypeWith === "weight"
-            ? weightWith * rateWith
-            : pieceWith * rateWith;
+          const totalWithout =
+            it.rateTypeWithout === "weight"
+              ? weightWithout * rateWithout
+              : pieceWithout * rateWithout;
+          const totalWith =
+            it.rateTypeWith === "weight"
+              ? weightWith * rateWith
+              : pieceWith * rateWith;
 
-          const productLabel = it.productName || (it.product && it.product.name) || it.productSku || "Item";
+          const productLabel =
+            it.productName ||
+            (it.product && it.product.name) ||
+            it.productSku ||
+            "Item";
+
+          // prefer itemDate on invoice line; fallback to invoice date
+          const rowDate = it.itemDate ? new Date(it.itemDate) : inv.date ? new Date(inv.date) : null;
 
           rows.push({
             ...base,
+            date: rowDate,
             product: productLabel,
             // without fields
             pieceWithout,
@@ -93,10 +104,18 @@ router.get("/", async (req, res) => {
           const weight = Number(x.weight || 0);
           const rate = Number(x.rate || 0);
           const totalXl = x.rateType === "weight" ? weight * rate : piece * rate;
-          const productLabel = x.productName || (x.product && x.product.name) || x.productSku || "XL Item";
+          const productLabel =
+            x.productName ||
+            (x.product && x.product.name) ||
+            x.productSku ||
+            "XL Item";
+
+          // prefer itemDate on xl line; fallback to invoice date
+          const rowDate = x.itemDate ? new Date(x.itemDate) : inv.date ? new Date(inv.date) : null;
 
           rows.push({
             ...base,
+            date: rowDate,
             product: `XL - ${productLabel}`,
             // without fields empty
             pieceWithout: 0,
@@ -115,7 +134,20 @@ router.get("/", async (req, res) => {
         }
       }
 
-      return res.json(rows);
+      // sort detailed rows by product date (ascending). Items without date go last.
+      rows.sort((a, b) => {
+        const da = a.date ? new Date(a.date).getTime() : Number.POSITIVE_INFINITY;
+        const db = b.date ? new Date(b.date).getTime() : Number.POSITIVE_INFINITY;
+        return da - db;
+      });
+
+      // Convert Date objects back to ISO strings for JSON (avoid sending Date objects)
+      const outRows = rows.map((r) => ({
+        ...r,
+        date: r.date ? new Date(r.date).toISOString() : null,
+      }));
+
+      return res.json(outRows);
     }
 
     // Legacy: invoice-level rows (when no customerId filter is applied)

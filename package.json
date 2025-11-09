@@ -2,11 +2,20 @@
   "name": "my-v0-project",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
+  "main": "electron/main.js",
+  "author": "",
+  "license": "MIT",
   "scripts": {
+    "dev": "next dev -p 3000",
+    "start": "next start -p 3000",
     "build": "next build",
-    "dev": "next dev",
     "lint": "next lint",
-    "start": "next start"
+    "electron:dev": "cross-env ELECTRON_DEV=true NODE_ENV=development electron .",
+    "electron:prod": "cross-env NODE_ENV=production electron .",
+    "dist": "npm run build && electron-builder --dir",
+    "package": "npm run build && electron-builder",
+    "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",
@@ -76,9 +85,62 @@
     "@types/node": "^22",
     "@types/react": "^18",
     "@types/react-dom": "^18",
+    "cross-env": "^7.0.3",
+    "electron-builder": "^23.6.0",
     "postcss": "^8.5",
     "tailwindcss": "^4.1.9",
     "tw-animate-css": "1.3.3",
     "typescript": "^5"
+  },
+  "build": {
+    "appId": "com.yourcompany.myapp",
+    "productName": "MyV0Project",
+    "files": [
+      "package.json",
+      ".next/**",
+      "public/**",
+      "server/**",
+      "electron/**",
+      "node_modules/**"
+    ],
+    "directories": {
+      "buildResources": "assets",
+      "output": "dist"
+    },
+    "extraResources": [
+      {
+        "from": "server/",
+        "to": "server/",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "icon": "assets/icon.icns"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "icon": "assets"
+    }
   }
 }

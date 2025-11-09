@@ -15,7 +15,11 @@ import { api } from "../lib/api";
  * - Adds Due Date edit in Full Edit and prints it.
  * - Adds Summary panel to Full Edit (mirrors NewInvoice calculation).
  *
- * Keep frontend inventory calls removed — backend must apply inventory changes atomically.
+ * Print flow updated to:
+ * - Build a standalone invoice HTML document
+ * - Convert remote logo to data: URL (more reliable)
+ * - Call Electron main via window.electronAPI.printHtmlPreview({ html, pageSize, delayMs })
+ * - Fallback to window.open + print in non-electron contexts
  */
 
 export default function Invoices() {
@@ -135,7 +139,9 @@ export default function Invoices() {
       number: inv.number,
       date: inv.date?.slice(0, 10) || new Date().toISOString().slice(0, 10),
       // dueDate may be undefined; convert to yyyy-mm-dd or empty string
-      dueDate: inv.dueDate ? new Date(inv.dueDate).toISOString().slice(0, 10) : "",
+      dueDate: inv.dueDate
+        ? new Date(inv.dueDate).toISOString().slice(0, 10)
+        : "",
       type: inv.type,
       customerId: inv.customer?._id || inv.customerId || "",
       items: (inv.items || []).map((it) => ({
@@ -152,24 +158,33 @@ export default function Invoices() {
         weightWith: it.weightWith || 0,
         rateWith: it.rateWith || 0,
         rateTypeWith: it.rateTypeWith || "piece",
-        itemDate: it.itemDate ? it.itemDate.slice(0, 10) : (inv.date ? inv.date.slice(0,10) : new Date().toISOString().slice(0,10)),
+        itemDate: it.itemDate
+          ? it.itemDate.slice(0, 10)
+          : inv.date
+          ? inv.date.slice(0, 10)
+          : new Date().toISOString().slice(0, 10),
         description: it.description || "",
         productName: it.productName || it.product?.name || "",
         productSku: it.productSku || it.product?.sku || "",
       })),
-      xlItems: (inv.xlItems || []).map((x) => ({
-        id: makeLocalId(),
-        invoiceItemId: x.invoiceItemId || undefined,
-        productId: x.product?._id || x.productId || "",
-        piece: x.piece || 0,
-        weight: x.weight || 0,
-        rate: x.rate || 0,
-        rateType: x.rateType || "weight",
-        itemDate: x.itemDate ? x.itemDate.slice(0, 10) : (inv.date ? inv.date.slice(0,10) : new Date().toISOString().slice(0,10)),
-        description: x.description || "",
-        productName: x.productName || x.product?.name || "",
-        productSku: x.productSku || x.product?.sku || "",
-      })) || [],
+      xlItems:
+        (inv.xlItems || []).map((x) => ({
+          id: makeLocalId(),
+          invoiceItemId: x.invoiceItemId || undefined,
+          productId: x.product?._id || x.productId || "",
+          piece: x.piece || 0,
+          weight: x.weight || 0,
+          rate: x.rate || 0,
+          rateType: x.rateType || "weight",
+          itemDate: x.itemDate
+            ? x.itemDate.slice(0, 10)
+            : inv.date
+            ? inv.date.slice(0, 10)
+            : new Date().toISOString().slice(0, 10),
+          description: x.description || "",
+          productName: x.productName || x.product?.name || "",
+          productSku: x.productSku || x.product?.sku || "",
+        })) || [],
     });
   }
 
@@ -245,7 +260,9 @@ export default function Invoices() {
       prev
         ? {
             ...prev,
-            items: prev.items.map((it, i) => (i === idx ? { ...it, ...patch } : it)),
+            items: prev.items.map((it, i) =>
+              i === idx ? { ...it, ...patch } : it
+            ),
           }
         : prev
     );
@@ -304,7 +321,9 @@ export default function Invoices() {
     const q = query.toLowerCase().trim();
     if (!q) return invoices;
     return invoices.filter((inv) => {
-      const hay = `${inv.number} ${inv.type} ${inv.customer?.name || ""} ${inv.customer?.firmName || ""}`.toLowerCase();
+      const hay = `${inv.number} ${inv.type} ${inv.customer?.name || ""} ${
+        inv.customer?.firmName || ""
+      }`.toLowerCase();
       return hay.includes(q);
     });
   }, [query, invoices]);
@@ -351,14 +370,102 @@ export default function Invoices() {
 
   /* ----------------- Print ----------------- */
 
-  function printInvoice(inv) {
+  // Convert a remote image URL to data: base64 URL (returns null on failure)
+  async function toDataUrl(url) {
+    if (!url) return null;
+    if (url.startsWith("data:")) return url;
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) return null;
+      const blob = await resp.blob();
+      const arr = await blob.arrayBuffer();
+      const base64 = btoa(String.fromCharCode(...new Uint8Array(arr)));
+      const mime = blob.type || "image/png";
+      return `data:${mime};base64,${base64}`;
+    } catch (e) {
+      console.warn("toDataUrl failed:", e);
+      return null;
+    }
+  }
+
+  // Wait for images/fonts inside a container to be ready (used by fallback)
+  async function ensureImagesAndFontsLoaded(container = document) {
+    try {
+      const imgs = Array.from(container.querySelectorAll("img"));
+      const decodes = imgs.map((img) => {
+        if (!img || !img.src) return Promise.resolve();
+        if (img.decode) return img.decode().catch(() => {});
+        return new Promise((res) => {
+          if (img.complete) return res();
+          img.addEventListener("load", res, { once: true });
+          img.addEventListener("error", res, { once: true });
+        });
+      });
+      const fontsReady =
+        document.fonts && document.fonts.ready
+          ? document.fonts.ready
+          : Promise.resolve();
+      await Promise.all([...decodes, fontsReady]);
+      await new Promise((r) => setTimeout(r, 120));
+    } catch (e) {
+      console.warn("ensureImagesAndFontsLoaded failed", e);
+    }
+  }
+
+  // place near other helpers in the file (or top of the component)
+  async function toDataUrl(src, timeoutMs = 8000) {
+    // fetch image and convert to data URL (base64)
+    if (!src) return null;
+    try {
+      const controller = new AbortController();
+      const id = setTimeout(() => controller.abort(), timeoutMs);
+      const res = await fetch(src, {
+        signal: controller.signal,
+        cache: "force-cache",
+      });
+      clearTimeout(id);
+      if (!res.ok) throw new Error("Image fetch failed");
+      const blob = await res.blob();
+      return await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error("FileReader error"));
+        reader.onload = () => resolve(reader.result);
+        reader.readAsDataURL(blob);
+      });
+    } catch (err) {
+      console.warn("toDataUrl failed for", src, err);
+      return null;
+    }
+  }
+
+  // Replace your current printInvoice with this function
+  async function printInvoice(inv) {
+    // debug: let devtools know this handler ran
+    console.log("[printInvoice] start", inv?.number);
+
+    // load profile
     let profile = null;
     try {
       const raw = localStorage.getItem("bb_profile");
       if (raw) profile = JSON.parse(raw);
-    } catch {}
+    } catch (e) {
+      console.warn("[printInvoice] profile parse failed", e);
+    }
 
-    const logoImg = profile?.logo || "";
+    // Convert remote logo to data-url for reliable printing inside a hidden BrowserWindow
+    let logoImg = profile?.logo || "";
+    if (
+      logoImg &&
+      !logoImg.startsWith("data:") &&
+      !logoImg.startsWith("blob:")
+    ) {
+      try {
+        const converted = await toDataUrl(logoImg).catch(() => null);
+        if (converted) logoImg = converted;
+      } catch (e) {
+        console.warn("[printInvoice] logo conversion failed", e);
+      }
+    }
 
     const cust = inv.customer || {};
     const custFirm = cust.firmName || cust.name || "-";
@@ -398,7 +505,10 @@ export default function Invoices() {
 
     const itemsHtml = (inv.items || [])
       .map((it, idx) => {
-        const itemDate = it.itemDate ? new Date(it.itemDate).toLocaleDateString() : new Date(inv.date).toLocaleDateString();
+        const itemDate = it.itemDate
+          ? new Date(it.itemDate).toLocaleDateString()
+          : new Date(inv.date).toLocaleDateString();
+
         const totalWithoutRow =
           it.rateTypeWithout === "weight"
             ? Number(it.rateWithout || 0) * Number(it.weightWithout || 0)
@@ -411,134 +521,240 @@ export default function Invoices() {
         const name = it.productName || (it.product && it.product.name) || "";
 
         return `<tr>
-          <td>${idx + 1}</td>
-          <td>${itemDate}</td>
-          <td>${name}</td>
-          <td style="text-align:right">${Number(it.pieceWithout || 0).toFixed(2)}</td>
-          <td style="text-align:right">${Number(it.weightWithout || 0).toFixed(2)}</td>
-          <td style="text-align:right">${Number(it.rateWithout || 0).toFixed(2)}</td>
-          <td style="text-align:right">${totalWithoutRow.toFixed(2)}</td>
-          <td style="text-align:right">${Number(it.pieceWith || 0).toFixed(2)}</td>
-          <td style="text-align:right">${Number(it.weightWith || 0).toFixed(2)}</td>
-          <td style="text-align:right">${Number(it.rateWith || 0).toFixed(2)}</td>
-          <td style="text-align:right">${totalWithRow.toFixed(2)}</td>
-        </tr>`;
+        <td>${idx + 1}</td>
+        <td>${itemDate}</td>
+        <td>${name}</td>
+        <td style="text-align:right">${Number(it.pieceWithout || 0).toFixed(
+          2
+        )}</td>
+        <td style="text-align:right">${Number(it.weightWithout || 0).toFixed(
+          2
+        )}</td>
+        <td style="text-align:right">${Number(it.rateWithout || 0).toFixed(
+          2
+        )}</td>
+        <td style="text-align:right">${totalWithoutRow.toFixed(2)}</td>
+        <td style="text-align:right">${Number(it.pieceWith || 0).toFixed(
+          2
+        )}</td>
+        <td style="text-align:right">${Number(it.weightWith || 0).toFixed(
+          2
+        )}</td>
+        <td style="text-align:right">${Number(it.rateWith || 0).toFixed(2)}</td>
+        <td style="text-align:right">${totalWithRow.toFixed(2)}</td>
+      </tr>`;
       })
       .join("");
 
     const xlItemsHtml = (inv.xlItems || [])
       .map((x, idx) => {
-        const itemDate = x.itemDate ? new Date(x.itemDate).toLocaleDateString() : new Date(inv.date).toLocaleDateString();
-        const totalXl = x.rateType === "weight" ? Number(x.rate || 0) * Number(x.weight || 0) : Number(x.rate || 0) * Number(x.piece || 0);
-        const xlLabel = `XL - ${x.productName || (x.product && x.product.name) || ""}`;
+        const itemDate = x.itemDate
+          ? new Date(x.itemDate).toLocaleDateString()
+          : new Date(inv.date).toLocaleDateString();
+        const totalXl =
+          x.rateType === "weight"
+            ? Number(x.rate || 0) * Number(x.weight || 0)
+            : Number(x.rate || 0) * Number(x.piece || 0);
+        const xlLabel = `XL - ${
+          x.productName || (x.product && x.product.name) || ""
+        }`;
 
         return `<tr style="background-color: #fef3c7">
-          <td>${(inv.items || []).length + idx + 1}</td>
-          <td>${itemDate}</td>
-          <td>${xlLabel}</td>
-          <td style="text-align:right">-</td>
-          <td style="text-align:right">-</td>
-          <td style="text-align:right">-</td>
-          <td style="text-align:right">-</td>
-          <td style="text-align:right">${Number(x.piece || 0).toFixed(2)}</td>
-          <td style="text-align:right">${Number(x.weight || 0).toFixed(2)}</td>
-          <td style="text-align:right">${Number(x.rate || 0).toFixed(2)}</td>
-          <td style="text-align:right">${totalXl.toFixed(2)}</td>
-        </tr>`;
+        <td>${(inv.items || []).length + idx + 1}</td>
+        <td>${itemDate}</td>
+        <td>${xlLabel}</td>
+        <td style="text-align:right">-</td>
+        <td style="text-align:right">-</td>
+        <td style="text-align:right">-</td>
+        <td style="text-align:right">-</td>
+        <td style="text-align:right">${Number(x.piece || 0).toFixed(2)}</td>
+        <td style="text-align:right">${Number(x.weight || 0).toFixed(2)}</td>
+        <td style="text-align:right">${Number(x.rate || 0).toFixed(2)}</td>
+        <td style="text-align:right">${totalXl.toFixed(2)}</td>
+      </tr>`;
       })
       .join("");
 
-    const termsAndConditions = profile?.termsAndConditions || "Thank You For Your Business!";
+    const termsAndConditions =
+      profile?.termsAndConditions || "Thank You For Your Business!";
 
-    const win = window.open("", "PRINT", "width=1200,height=1100");
-    win.document.write(`
-      <html>
-        <head>
-          <title>Invoice #${inv.number}</title>
-          <style>
-            body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; padding: 24px; color: #0f172a; font-size: 12px; }
-            .muted{ color:#64748b; }
-            .row { display:flex; justify-content:space-between; gap: 16px; }
-            .box { border:1px solid #e5e7eb; border-radius:8px; padding:12px; }
-            table { width:100%; border-collapse:collapse; margin-top:16px; font-size: 11px; }
-            th, td { border-bottom:1px solid #e5e7eb; padding:6px; text-align:left; }
-            th { background:#f1f5f9; text-align:left; font-weight: bold; }
-            .title { font-weight:800; font-size: 22px; letter-spacing: .5px; }
-            .center { text-align:center; }
-            .subtotal-row { font-weight: bold; background: #f1f5f9; }
-            img.logo { max-width: 100px; max-height: 60px; margin-bottom: 8px; }
-          </style>
-        </head>
-        <body>
-          <div class="center">
-            ${logoImg ? `<img src="${logoImg}" alt="Logo" class="logo" />` : ""}
-            <div class="title">${profile?.firmName || "Your Company"}</div>
-            <div class="muted">${profile?.address || ""}</div>
-            <div class="muted">${profile?.phone || ""}${profile?.email ? " · " + profile?.email : ""}</div>
-            ${ profile?.gstin ? `<div class="muted">GSTIN: ${profile.gstin}</div>` : "" }
+    const htmlDoc = `<!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8"/>
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <title>Invoice #${inv.number}</title>
+        <style>
+          body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; color:#0f172a; padding:24px; background: white; }
+          .center { text-align:center; }
+          .logo { max-width:120px; max-height:80px; margin-bottom:8px; display:block; margin-left:auto; margin-right:auto; }
+          .box { border:1px solid #e5e7eb; border-radius:8px; padding:12px; }
+          table { width:100%; border-collapse:collapse; margin-top:16px; font-size:11px; }
+          th, td { padding:6px; border-bottom:1px solid #e5e7eb; vertical-align: middle; }
+          thead th { background:#f1f5f9; text-align:left; font-weight:bold; }
+          .muted { color:#64748b; }
+        </style>
+      </head>
+      <body>
+        <div class="center">
+          ${logoImg ? `<img src="${logoImg}" alt="Logo" class="logo" />` : ""}
+          <div style="font-weight:800; font-size:22px;">${
+            profile?.firmName || "Your Company"
+          }</div>
+          <div class="muted">${profile?.address || ""}</div>
+          <div class="muted">${profile?.phone || ""}${
+      profile?.email ? " · " + profile?.email : ""
+    }</div>
+          ${
+            profile?.gstin
+              ? `<div class="muted">GSTIN: ${profile.gstin}</div>`
+              : ""
+          }
+        </div>
+
+        <h2 style="margin-top:16px">INVOICE</h2>
+
+        <div style="display:flex; justify-content:space-between; gap:16px; margin-top:8px; align-items:flex-start;">
+          <div style="flex:1" class="box">
+            <div><strong>Bill To</strong></div>
+            <div>${custFirm}</div>
+            <div class="muted">${custAddr}</div>
+            <div class="muted">${custPhone}${
+      custEmail ? " · " + custEmail : ""
+    }</div>
           </div>
-
-          <h2 style="margin-top:16px">INVOICE</h2>
-
-          <div class="row" style="margin-top:8px">
-            <div class="box" style="flex:1">
-              <div><strong>Bill To</strong></div>
-              <div>${custFirm}</div>
-              <div class="muted">${custAddr}</div>
-              <div class="muted">${custPhone}${custEmail ? " · " + custEmail : ""}</div>
-            </div>
-            <div class="box" style="width: 320px">
-              <div><strong>Invoice #</strong> ${inv.number}</div>
-              <div><strong>Date</strong> ${new Date(inv.date).toLocaleDateString()}</div>
-              <div><strong>Due</strong> ${inv.dueDate ? new Date(inv.dueDate).toLocaleDateString() : "-"}</div>
-              <div><strong>Type</strong> ${inv.type}</div>
-            </div>
+          <div style="width:320px" class="box">
+            <div><strong>Invoice #</strong> ${inv.number}</div>
+            <div><strong>Date</strong> ${new Date(
+              inv.date
+            ).toLocaleDateString()}</div>
+            <div><strong>Due</strong> ${
+              inv.dueDate ? new Date(inv.dueDate).toLocaleDateString() : "-"
+            }</div>
+            <div><strong>Type</strong> ${inv.type}</div>
           </div>
+        </div>
 
-          <table>
-            <thead>
-              <tr>
-                <th>Sr</th>
-                <th>Date</th>
-                <th>Kapan</th>
-                <th style="text-align:right">Piece (Without)</th>
-                <th style="text-align:right">Weight (Without)</th>
-                <th style="text-align:right">Rate (Without)</th>
-                <th style="text-align:right">Total (Without)</th>
-                <th style="text-align:right">Piece (With)</th>
-                <th style="text-align:right">Weight (With)</th>
-                <th style="text-align:right">Rate (With)</th>
-                <th style="text-align:right">Total (With)</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${itemsHtml}
-              ${xlItemsHtml}
-            </tbody>
-            <tfoot>
-              <tr class="subtotal-row">
-                <td colspan="6" style="text-align:right">Total (Without)</td>
-                <td style="text-align:right">${totalWithout.toFixed(2)}</td>
-                <td colspan="3" style="text-align:right">Total (With)</td>
-                <td style="text-align:right">${totalWith.toFixed(2)}</td>
-              </tr>
-              ${ xlTotal > 0 ? `<tr class="subtotal-row"><td colspan="10" style="text-align:right">Total (XL)</td><td style="text-align:right">${xlTotal.toFixed(2)}</td></tr>` : "" }
-              <tr class="subtotal-row">
-                <td colspan="10" style="text-align:right"><strong>Grand Total</strong></td>
-                <td style="text-align:right"><strong>${grandTotal.toFixed(2)}</strong></td>
-              </tr>
-            </tfoot>
-          </table>
-          <div style="margin-top:24px; border-top:1px solid #e5e7eb; padding-top:12px;" class="muted">
-            <strong>Terms and Conditions:</strong><br />${termsAndConditions}
-          </div>
-        </body>
-      </html>
-    `);
-    win.document.close();
-    win.focus();
-    win.print();
-    win.close();
+        <table>
+          <thead>
+            <tr>
+              <th>Sr</th>
+              <th>Date</th>
+              <th>Kapan</th>
+              <th style="text-align:right">Piece (Without)</th>
+              <th style="text-align:right">Weight (Without)</th>
+              <th style="text-align:right">Rate (Without)</th>
+              <th style="text-align:right">Total (Without)</th>
+              <th style="text-align:right">Piece (With)</th>
+              <th style="text-align:right">Weight (With)</th>
+              <th style="text-align:right">Rate (With)</th>
+              <th style="text-align:right">Total (With)</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${itemsHtml}
+            ${xlItemsHtml}
+          </tbody>
+          <tfoot>
+            <tr style="font-weight:700; background:#f1f5f9;">
+              <td colspan="6" style="text-align:right">Total (Without)</td>
+              <td style="text-align:right">${totalWithout.toFixed(2)}</td>
+              <td colspan="3" style="text-align:right">Total (With)</td>
+              <td style="text-align:right">${totalWith.toFixed(2)}</td>
+            </tr>
+            ${
+              xlTotal > 0
+                ? `<tr style="font-weight:700; background:#f1f5f9;"><td colspan="10" style="text-align:right">Total (XL)</td><td style="text-align:right">${xlTotal.toFixed(
+                    2
+                  )}</td></tr>`
+                : ""
+            }
+            <tr style="font-weight:900; font-size:1.0rem; background:#f1f5f9;">
+              <td colspan="10" style="text-align:right">Grand Total</td>
+              <td style="text-align:right">${grandTotal.toFixed(2)}</td>
+            </tr>
+          </tfoot>
+        </table>
+
+        <div style="margin-top:24px; border-top:1px solid #e5e7eb; padding-top:12px;" class="muted">
+          <strong>Terms and Conditions:</strong><br/>${termsAndConditions}
+        </div>
+      </body>
+    </html>`;
+
+    // Debug: log if electronAPI present
+    try {
+      if (window && window.electronAPI && window.electronAPI.__isElectron) {
+        console.log(
+          "[printInvoice] electronAPI available — calling printHtmlPreview"
+        );
+      } else {
+        console.warn(
+          "[printInvoice] electronAPI NOT available — falling back to browser preview"
+        );
+      }
+    } catch (e) {
+      console.warn("[printInvoice] electronAPI check failed", e);
+    }
+
+    // Use electron IPC if available — this will create a hidden BrowserWindow, printToPDF and open PDF preview (your main handles it)
+    if (
+      typeof window !== "undefined" &&
+      window.electronAPI &&
+      typeof window.electronAPI.printHtmlPreview === "function"
+    ) {
+      try {
+        const res = await window.electronAPI.printHtmlPreview({
+          html: htmlDoc,
+          pageSize: "A4",
+          landscape: false,
+          delayMs: 600,
+        });
+        if (!res || !res.ok) {
+          console.error(
+            "[printInvoice] printHtmlPreview returned failure",
+            res
+          );
+          alert(
+            "Preview failed: " + (res && res.error ? res.error : "unknown")
+          );
+        }
+        return;
+      } catch (err) {
+        console.error("[printInvoice] printHtmlPreview error", err);
+        // fall through to fallback preview below
+      }
+    }
+
+    // Fallback: open a new browser window with the invoice HTML (no immediate window.print).
+    // This allows native browser PDF/print UI (Chrome-style preview + Save as PDF).
+    try {
+      const w = window.open(
+        "",
+        `_invoice_preview_${Date.now()}`,
+        "width=1000,height=1200,scrollbars=yes"
+      );
+      if (!w) {
+        alert("Unable to open preview window. Your browser blocked popups.");
+        return;
+      }
+      w.document.open();
+      w.document.write(htmlDoc);
+      w.document.close();
+
+      // Wait a moment so images/fonts load in the new window, then focus it for user interaction.
+      setTimeout(() => {
+        try {
+          w.focus();
+        } catch (e) {}
+      }, 300);
+
+      // Do NOT call w.print() automatically. Let the user use the browser preview toolbar to Save as PDF / Print.
+      return;
+    } catch (err) {
+      console.error("[printInvoice] fallback preview error", err);
+      alert("Unable to preview invoice: " + (err.message || err));
+    }
   }
 
   /* ----------------- Customers & Products ----------------- */
@@ -563,31 +779,43 @@ export default function Invoices() {
   /* ----------------- Full Edit Summary ----------------- */
 
   const fullEditSummary = useMemo(() => {
-    if (!fullEditData) return { itemsCount: 0, xlCount: 0, totalWithout: 0, totalWith: 0, xlTotal: 0, grandTotal: 0 };
+    if (!fullEditData)
+      return {
+        itemsCount: 0,
+        xlCount: 0,
+        totalWithout: 0,
+        totalWith: 0,
+        xlTotal: 0,
+        grandTotal: 0,
+      };
     const items = fullEditData.items || [];
     const xl = fullEditData.xlItems || [];
 
     let totalWithout = 0;
     let totalWith = 0;
     for (const it of items) {
-      const rowWithout = (it.rateTypeWithout === "weight")
-        ? (Number(it.weightWithout || 0) * Number(it.rateWithout || 0))
-        : (Number(it.pieceWithout || 0) * Number(it.rateWithout || 0));
-      const rowWith = (it.rateTypeWith === "weight")
-        ? (Number(it.weightWith || 0) * Number(it.rateWith || 0))
-        : (Number(it.pieceWith || 0) * Number(it.rateWith || 0));
+      const rowWithout =
+        it.rateTypeWithout === "weight"
+          ? Number(it.weightWithout || 0) * Number(it.rateWithout || 0)
+          : Number(it.pieceWithout || 0) * Number(it.rateWithout || 0);
+      const rowWith =
+        it.rateTypeWith === "weight"
+          ? Number(it.weightWith || 0) * Number(it.rateWith || 0)
+          : Number(it.pieceWith || 0) * Number(it.rateWith || 0);
       totalWithout += rowWithout;
       totalWith += rowWith;
     }
 
     const xlTotal = (xl || []).reduce((s, x) => {
-      const xVal = (x.rateType === "weight")
-        ? (Number(x.weight || 0) * Number(x.rate || 0))
-        : (Number(x.piece || 0) * Number(x.rate || 0));
+      const xVal =
+        x.rateType === "weight"
+          ? Number(x.weight || 0) * Number(x.rate || 0)
+          : Number(x.piece || 0) * Number(x.rate || 0);
       return s + xVal;
     }, 0);
 
-    const grandTotal = Number(totalWithout || 0) + Number(totalWith || 0) + Number(xlTotal || 0);
+    const grandTotal =
+      Number(totalWithout || 0) + Number(totalWith || 0) + Number(xlTotal || 0);
 
     return {
       itemsCount: items.length,
@@ -662,7 +890,10 @@ export default function Invoices() {
                   type="date"
                   value={fullEditData?.dueDate || ""}
                   onChange={(e) =>
-                    setFullEditData({ ...fullEditData, dueDate: e.target.value })
+                    setFullEditData({
+                      ...fullEditData,
+                      dueDate: e.target.value,
+                    })
                   }
                 />
               </div>
@@ -729,7 +960,6 @@ export default function Invoices() {
                       >
                         <option value="">Select</option>
                         {products?.map((p) => (
-                          // FIXED: value should be p._id (previously p._1 typo)
                           <option key={p._id} value={p._id}>
                             {p.name}
                           </option>
@@ -741,20 +971,44 @@ export default function Invoices() {
                       <input
                         className="w-full border rounded px-3 py-2"
                         value={it.description || ""}
-                        onChange={(e) => updateFullEditItem(idx, { description: e.target.value })}
+                        onChange={(e) =>
+                          updateFullEditItem(idx, {
+                            description: e.target.value,
+                          })
+                        }
                       />
                     </div>
                   </div>
 
-                  <div style={{ paddingTop: "0.5rem", borderTop: "1px solid #e5e7eb" }}>
-                    <h4 style={{ margin: "0.5rem 0", fontSize: "0.875rem", color: "#475569" }}>
+                  <div
+                    style={{
+                      paddingTop: "0.5rem",
+                      borderTop: "1px solid #e5e7eb",
+                    }}
+                  >
+                    <h4
+                      style={{
+                        margin: "0.5rem 0",
+                        fontSize: "0.875rem",
+                        color: "#475569",
+                      }}
+                    >
                       Without Symbol
                     </h4>
                     <div className="grid grid-4 gap-2">
                       <div>
-                        <label className="block text-sm mb-1">Rate Depends On</label>
-                        <select className="w-full border rounded px-3 py-2" value={it.rateTypeWithout || "piece"}
-                          onChange={(e) => updateFullEditItem(idx, { rateTypeWithout: e.target.value })}>
+                        <label className="block text-sm mb-1">
+                          Rate Depends On
+                        </label>
+                        <select
+                          className="w-full border rounded px-3 py-2"
+                          value={it.rateTypeWithout || "piece"}
+                          onChange={(e) =>
+                            updateFullEditItem(idx, {
+                              rateTypeWithout: e.target.value,
+                            })
+                          }
+                        >
                           <option value="piece">Per Piece</option>
                           <option value="weight">Per Weight</option>
                         </select>
@@ -805,14 +1059,29 @@ export default function Invoices() {
                   </div>
 
                   <div style={{ paddingTop: "0.5rem" }}>
-                    <h4 style={{ margin: "0.5rem 0", fontSize: "0.875rem", color: "#475569" }}>
+                    <h4
+                      style={{
+                        margin: "0.5rem 0",
+                        fontSize: "0.875rem",
+                        color: "#475569",
+                      }}
+                    >
                       With Symbol
                     </h4>
                     <div className="grid grid-4 gap-2">
                       <div>
-                        <label className="block text-sm mb-1">Rate Depends On</label>
-                        <select className="w-full border rounded px-3 py-2" value={it.rateTypeWith || "piece"}
-                          onChange={(e) => updateFullEditItem(idx, { rateTypeWith: e.target.value })}>
+                        <label className="block text-sm mb-1">
+                          Rate Depends On
+                        </label>
+                        <select
+                          className="w-full border rounded px-3 py-2"
+                          value={it.rateTypeWith || "piece"}
+                          onChange={(e) =>
+                            updateFullEditItem(idx, {
+                              rateTypeWith: e.target.value,
+                            })
+                          }
+                        >
                           <option value="piece">Per Piece</option>
                           <option value="weight">Per Weight</option>
                         </select>
@@ -934,7 +1203,9 @@ export default function Invoices() {
                           setFullEditData((prev) => ({
                             ...prev,
                             xlItems: prev.xlItems.map((it, i) =>
-                              i === idx ? { ...it, description: e.target.value } : it
+                              i === idx
+                                ? { ...it, description: e.target.value }
+                                : it
                             ),
                           }))
                         }
@@ -944,13 +1215,19 @@ export default function Invoices() {
 
                   <div className="grid grid-4 gap-2 mt-2">
                     <div>
-                      <label className="block text-sm mb-1">Rate Depends On</label>
-                      <select className="w-full border rounded px-3 py-2" value={x.rateType || "weight"}
+                      <label className="block text-sm mb-1">
+                        Rate Depends On
+                      </label>
+                      <select
+                        className="w-full border rounded px-3 py-2"
+                        value={x.rateType || "weight"}
                         onChange={(e) =>
                           setFullEditData((prev) => ({
                             ...prev,
                             xlItems: prev.xlItems.map((it, i) =>
-                              i === idx ? { ...it, rateType: e.target.value } : it
+                              i === idx
+                                ? { ...it, rateType: e.target.value }
+                                : it
                             ),
                           }))
                         }
@@ -970,7 +1247,9 @@ export default function Invoices() {
                           setFullEditData((prev) => ({
                             ...prev,
                             xlItems: prev.xlItems.map((it, i) =>
-                              i === idx ? { ...it, piece: Number(e.target.value) } : it
+                              i === idx
+                                ? { ...it, piece: Number(e.target.value) }
+                                : it
                             ),
                           }))
                         }
@@ -987,7 +1266,9 @@ export default function Invoices() {
                           setFullEditData((prev) => ({
                             ...prev,
                             xlItems: prev.xlItems.map((it, i) =>
-                              i === idx ? { ...it, weight: Number(e.target.value) } : it
+                              i === idx
+                                ? { ...it, weight: Number(e.target.value) }
+                                : it
                             ),
                           }))
                         }
@@ -1004,7 +1285,9 @@ export default function Invoices() {
                           setFullEditData((prev) => ({
                             ...prev,
                             xlItems: prev.xlItems.map((it, i) =>
-                              i === idx ? { ...it, rate: Number(e.target.value) } : it
+                              i === idx
+                                ? { ...it, rate: Number(e.target.value) }
+                                : it
                             ),
                           }))
                         }
@@ -1059,27 +1342,39 @@ export default function Invoices() {
               <div className="grid grid-3">
                 <div>
                   <div className="subtle">Items</div>
-                  <div style={{ fontWeight: 700 }}>{fullEditSummary.itemsCount}</div>
+                  <div style={{ fontWeight: 700 }}>
+                    {fullEditSummary.itemsCount}
+                  </div>
                 </div>
                 <div>
                   <div className="subtle">XL Items</div>
-                  <div style={{ fontWeight: 700 }}>{fullEditSummary.xlCount}</div>
+                  <div style={{ fontWeight: 700 }}>
+                    {fullEditSummary.xlCount}
+                  </div>
                 </div>
                 <div>
                   <div className="subtle">Total (Without)</div>
-                  <div style={{ fontWeight: 700 }}>{Number(fullEditSummary.totalWithout || 0).toFixed(2)}</div>
+                  <div style={{ fontWeight: 700 }}>
+                    {Number(fullEditSummary.totalWithout || 0).toFixed(2)}
+                  </div>
                 </div>
                 <div>
                   <div className="subtle">Total (With)</div>
-                  <div style={{ fontWeight: 700 }}>{Number(fullEditSummary.totalWith || 0).toFixed(2)}</div>
+                  <div style={{ fontWeight: 700 }}>
+                    {Number(fullEditSummary.totalWith || 0).toFixed(2)}
+                  </div>
                 </div>
                 <div>
                   <div className="subtle">Total (XL)</div>
-                  <div style={{ fontWeight: 700 }}>{Number(fullEditSummary.xlTotal || 0).toFixed(2)}</div>
+                  <div style={{ fontWeight: 700 }}>
+                    {Number(fullEditSummary.xlTotal || 0).toFixed(2)}
+                  </div>
                 </div>
                 <div>
                   <div className="subtle">Grand Total</div>
-                  <div style={{ fontWeight: 900, fontSize: "1.1rem" }}>{Number(fullEditSummary.grandTotal || 0).toFixed(2)}</div>
+                  <div style={{ fontWeight: 900, fontSize: "1.1rem" }}>
+                    {Number(fullEditSummary.grandTotal || 0).toFixed(2)}
+                  </div>
                 </div>
               </div>
             </div>
