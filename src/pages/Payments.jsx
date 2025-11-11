@@ -48,7 +48,7 @@ export default function Payments() {
   }
 
   async function remove(id) {
-    await api.delete(`/payments/${id}`)
+    await api.del(`/payments/${id}`)
     load()
   }
 

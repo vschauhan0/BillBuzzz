@@ -1,0 +1,119 @@
+*** Begin Patch
+*** Update File: electron/main.js
+@@
+-function createMainWindow(loadUrl) {
+-  const preloadPath = resolvePreloadPath();
+-  safeLog("Using preload ->", preloadPath);
+-  const win = new BrowserWindow({
+-    width: 1200,
+-    height: 800,
+-    webPreferences: {
+-      preload: preloadPath,
+-      nodeIntegration: false,
+-      contextIsolation: true,
+-    },
+-  });
+-
+-  win.loadURL(loadUrl).catch((e) => safeLog("mainWindow.loadURL error", e));
+-  if (isDev) win.webContents.openDevTools({ mode: "detach" });
+-
+-  win.on("closed", () => {
+-    if (mainWindow === win) mainWindow = null;
+-  });
+-  mainWindow = win;
+-  return win;
+-}
++function createMainWindow(loadUrl) {
++  const preloadPath = resolvePreloadPath();
++  safeLog("Using preload ->", preloadPath);
++  const win = new BrowserWindow({
++    width: 1200,
++    height: 800,
++    webPreferences: {
++      preload: preloadPath,
++      nodeIntegration: false,
++      contextIsolation: true,
++    },
++  });
++
++  // Load the provided URL (dev: http://localhost:3000, prod: file://... or local next server)
++  win.loadURL(loadUrl).catch((e) => safeLog("mainWindow.loadURL error", e));
++
++  // Ensure relative resolution for / and localhost links in packaged app:
++  // 1) Inject <base href="./"> so absolute /... paths resolve relative to the file context.
++  // 2) Rewrite any lingering http(s)://localhost:PORT/_next/... or leading /_next/... to ./_next/ so CSS/JS load locally.
++  win.webContents.on('dom-ready', () => {
++    try {
++      win.webContents.executeJavaScript(`
++        (function() {
++          try {
++            // Inject base tag if missing
++            if (!document.querySelector('base')) {
++              const base = document.createElement('base');
++              base.href = './';
++              document.head.prepend(base);
++            }
++
++            // rewrite helper: localhost:PORT/_next/... -> ./_next/...  and  /_next/... -> ./_next/...
++            const rewrite = (url) => {
++              if (!url) return url;
++              const localhostPattern = /^https?:\\/\\/localhost:\\d+\\/_next\\//;
++              if (localhostPattern.test(url)) return url.replace(localhostPattern, './_next/');
++              const absNext = /^\\/_next\\//;
++              if (absNext.test(url)) return url.replace(absNext, './_next/');
++              return url;
++            };
++
++            Array.from(document.querySelectorAll('link[rel="stylesheet"]')).forEach(l => {
++              try {
++                const h = l.getAttribute('href');
++                const newHref = rewrite(h);
++                if (newHref && newHref !== h) l.setAttribute('href', newHref);
++              } catch(e){}
++            });
++
++            Array.from(document.querySelectorAll('script[src]')).forEach(s => {
++              try {
++                const s0 = s.getAttribute('src');
++                const newSrc = rewrite(s0);
++                if (newSrc && newSrc !== s0) s.setAttribute('src', newSrc);
++              } catch(e){}
++            });
++
++            // Observe future DOM insertions (in case scripts/styles are injected later)
++            const mo = new MutationObserver(muts => {
++              for (const m of muts) {
++                for (const n of Array.from(m.addedNodes || [])) {
++                  if (n && n.nodeType === 1) {
++                    try {
++                      if (n.tagName === 'LINK' && n.rel === 'stylesheet') {
++                        const newHref = rewrite(n.getAttribute('href'));
++                        if (newHref) n.setAttribute('href', newHref);
++                      }
++                      if (n.tagName === 'SCRIPT' && n.getAttribute('src')) {
++                        const newSrc = rewrite(n.getAttribute('src'));
++                        if (newSrc) n.setAttribute('src', newSrc);
++                      }
++                    } catch(e){}
++                  }
++                }
++              }
++            });
++            mo.observe(document.documentElement || document, { childList: true, subtree: true });
++          } catch (inner) { /* ignore page-level errors */ }
++        })();
++      `).catch(()=>{});
++    } catch (e) {
++      safeLog("dom-ready injection failed", e && e.message ? e.message : e);
++    }
++  });
++
++  if (isDev) win.webContents.openDevTools({ mode: "detach" });
++
++  win.on("closed", () => {
++    if (mainWindow === win) mainWindow = null;
++  });
++  mainWindow = win;
++  return win;
++}
+*** End Patch

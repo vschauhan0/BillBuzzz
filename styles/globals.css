@@ -1,6 +1,11 @@
-@import 'tailwindcss';
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* optional import of 3rd-party CSS that depends on Tailwind utilities */
 @import 'tw-animate-css';
 
+/* existing custom CSS comes after Tailwind directives */
 @custom-variant dark (&:is(.dark *));
 
 :root {

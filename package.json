@@ -1,5 +1,5 @@
 {
-  "name": "my-v0-project",
+  "name": "billbuzz",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -13,9 +13,9 @@
     "lint": "next lint",
     "electron:dev": "cross-env ELECTRON_DEV=true NODE_ENV=development electron .",
     "electron:prod": "cross-env NODE_ENV=production electron .",
-    "dist": "npm run build && electron-builder --dir",
-    "package": "npm run build && electron-builder",
-    "postinstall": "electron-builder install-app-deps"
+    "dist": "npm run build && npm run build:server:prod && electron-builder --dir",
+    "package": "npm run build && npm run build:server:prod && electron-builder",
+    "build:server:prod": "cd server && npm ci --omit=dev --production && cd .."
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",
@@ -47,7 +47,6 @@
     "@radix-ui/react-toggle-group": "1.1.1",
     "@radix-ui/react-tooltip": "1.1.6",
     "@vercel/analytics": "1.3.1",
-    "autoprefixer": "^10.4.20",
     "bcryptjs": "latest",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -55,9 +54,8 @@
     "cors": "latest",
     "date-fns": "4.1.0",
     "dotenv": "^17.2.3",
-    "electron": "latest",
     "embla-carousel-react": "8.5.1",
-    "express": "latest",
+    "express": "^5.1.0",
     "geist": "^1.3.1",
     "input-otp": "1.4.1",
     "jsbarcode": "latest",
@@ -72,7 +70,7 @@
     "react-dom": "^18.3.1",
     "react-hook-form": "^7.60.0",
     "react-resizable-panels": "^2.1.7",
-    "react-router-dom": "latest",
+    "react-router-dom": "^7.9.5",
     "recharts": "2.15.4",
     "sonner": "^1.7.4",
     "tailwind-merge": "^2.5.5",
@@ -81,41 +79,66 @@
     "zod": "3.25.76"
   },
   "devDependencies": {
-    "@tailwindcss/postcss": "^4.1.9",
+    "@tailwindcss/postcss": "4.1.17",
     "@types/node": "^22",
     "@types/react": "^18",
     "@types/react-dom": "^18",
+    "autoprefixer": "10.4.21",
     "cross-env": "^7.0.3",
-    "electron-builder": "^23.6.0",
-    "postcss": "^8.5",
-    "tailwindcss": "^4.1.9",
+    "electron": "39.1.1",
+    "electron-builder": "^26.0.12",
+    "pkg": "^5.8.1",
+    "postcss": "8.5.6",
+    "tailwindcss": "4.1.17",
     "tw-animate-css": "1.3.3",
     "typescript": "^5"
   },
   "build": {
+    "asar": false,
     "appId": "com.yourcompany.myapp",
-    "productName": "MyV0Project",
+    "productName": "BillBuzz",
     "files": [
-      "package.json",
-      ".next/**",
-      "public/**",
-      "server/**",
-      "electron/**",
-      "node_modules/**"
+      "**/*",
+      "!dist/**",
+      "!**/*.map",
+      "!**/*.log"
     ],
-    "directories": {
-      "buildResources": "assets",
-      "output": "dist"
-    },
     "extraResources": [
       {
         "from": "server/",
         "to": "server/",
         "filter": [
+          "**/*",
+          "package.json",
+          "package-lock.json"
+        ]
+      },
+      {
+        "from": ".next/standalone",
+        "to": ".next/standalone",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": ".next/static",
+        "to": ".next/static",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": ".next/static",
+        "to": "app/.next/static",
+        "filter": [
           "**/*"
         ]
       }
     ],
+    "directories": {
+      "buildResources": "assets",
+      "output": "dist"
+    },
     "win": {
       "target": [
         "nsis",

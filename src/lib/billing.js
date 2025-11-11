@@ -157,3 +157,50 @@ export async function previewPdfInWindow(docOrBlob, { filename = "invoice.pdf" }
   // return reference so caller can revoke URL after some time if wanted
   return { url, blob, windowRef: w };
 }
+
+/* ---------------------------
+   ADDED: billing helpers expected by NewInvoice.jsx
+   --------------------------- */
+
+/**
+ * getFinancialYear(date)
+ * Returns a string like "2024-2025" for the FY Apr 1 - Mar 31 convention.
+ * Pure function (safe in Node & browser).
+ */
+export function getFinancialYear(date = new Date()) {
+  const d = new Date(date);
+  const yr = d.getFullYear();
+  // months: 0..11
+  const month = d.getMonth() + 1;
+  if (month >= 4) {
+    return `${yr}-${yr + 1}`;
+  } else {
+    return `${yr - 1}-${yr}`;
+  }
+}
+
+/**
+ * recordInvoiceNumber({ invoice, strategy })
+ *
+ * Simple, synchronous helper that returns the next invoice number.
+ * - If invoice.number is provided (numeric), returns invoice.number (assumes already assigned).
+ * - If invoice.number is missing, returns a deterministic next number:
+ *     <financialYearSuffix>-<timestampShort>
+ *   Example: "24-1699999999999"
+ *
+ * NOTE: This is intentionally non-IO (no DB or localStorage) so it won't fail SSR.
+ * Replace the internals with your DB call later if you persist numbers server-side.
+ */
+export function recordInvoiceNumber({ invoice = {}, strategy = "clientFallback" } = {}) {
+  if (invoice.number || invoice.invoiceNumber) {
+    // keep existing number if present
+    return invoice.number || invoice.invoiceNumber;
+  }
+
+  // Simple deterministic fallback number:
+  // Use last two digits of financial year start + epoch ms truncated
+  const fy = getFinancialYear(invoice.date || new Date()); // e.g. "2024-2025"
+  const fyStart = fy.split("-")[0].slice(-2); // e.g. "24"
+  const ts = Date.now().toString().slice(-8); // last 8 digits of epoch (keeps it short)
+  return `${fyStart}-${ts}`;
+}
